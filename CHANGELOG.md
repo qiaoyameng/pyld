@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added a `listDiagnostics` option to `jsonld.from_rdf()` that returns per-chain diagnostics describing whether each candidate `rdf:List` chain was folded into `@list` and the located obstacles (multiple `rdf:first`/`rdf:rest`, gaps, cycles, shared tails, extra properties, invalid types, cross-named-graph references). Malformed chains remain ordinary nodes and never fail the conversion.
 - Migrate `canon.py` to `rdflib`
   - Added `rdflib` dependency in all relevant config and code files.
   - Added `util.py`:

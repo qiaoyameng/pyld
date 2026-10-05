@@ -278,7 +278,8 @@ def from_rdf(input_, options: FromRdfOptions | None = None):
       by the format option or an RDF dataset to convert.
     :param options: optional processing options; see Options below.
 
-    :return: the JSON-LD output.
+    :return: the JSON-LD output, or a `{'output': ..., 'listDiagnostics': ...}`
+      mapping when the `listDiagnostics` option is enabled.
     """
     return JsonLdProcessor().from_rdf(input_, options)
 
@@ -3038,6 +3039,12 @@ class JsonLdProcessor:
                         'value': value,
                     }
 
+        # Capture candidate rdf:List chains before folding so that chain
+        # diagnostics can reference the original input nodes and graph names.
+        list_snapshot = None
+        if options.get('listDiagnostics', False):
+            list_snapshot = self._snapshot_rdf_list_chains(graph_map)
+
         for _name, graph_object in graph_map.items():
             # Convert compound-literal blank nodes before list conversion, so
             # list items can also contain directional value objects.
@@ -3071,9 +3078,10 @@ class JsonLdProcessor:
                 while (
                     property == str(RDF.rest)
                     and _is_object(referenced_once.get(node['@id']))
-                    and _is_array(node[str(RDF.first)])
+                    and node['@id'] in graph_object
+                    and _is_array(node.get(str(RDF.first)))
                     and len(node[str(RDF.first)]) == 1
-                    and _is_array(node[str(RDF.rest)])
+                    and _is_array(node.get(str(RDF.rest)))
                     and len(node[str(RDF.rest)]) == 1
                     and (
                         node_key_count == 3
@@ -3110,6 +3118,12 @@ class JsonLdProcessor:
             del nil['usages']
             # nil.pop('usages', None)
 
+        list_diagnostics = None
+        if list_snapshot is not None:
+            list_diagnostics = self._finalize_rdf_list_diagnostics(
+                graph_map, list_snapshot
+            )
+
         result = []
         for subject, node in sorted(default_graph.items()):
             if subject in graph_map:
@@ -3122,7 +3136,463 @@ class JsonLdProcessor:
             if not _is_subject_reference(node):
                 result.append(node)
 
+        if list_diagnostics is not None:
+            return {'output': result, 'listDiagnostics': list_diagnostics}
         return result
+
+
+    def _snapshot_rdf_list_chains(self, graph_map):
+        """
+        Record every candidate `rdf:List` chain before folding.
+
+        The snapshot is computed read-only from the node map, so malformed
+        chains can never make the conversion fail. Each entry locates the
+        original input nodes and the graph name.
+
+        :param graph_map: the per-graph node maps built from the input quads.
+
+        :return: a list of per-chain diagnostic entries in deterministic
+          (graph, head) order.
+        """
+        first = str(RDF.first)
+        rest = str(RDF.rest)
+        nil_id = str(RDF.nil)
+
+        graph_order = [
+            '@default',
+            *sorted(name for name in graph_map if name != '@default'),
+        ]
+
+        # Count incoming references to each node across all graphs. A cons
+        # node can only be folded losslessly when it has exactly one
+        # reference; the folding pass tracks the same information globally.
+        incoming = {}
+        for name in graph_order:
+            for node in graph_map[name].values():
+                for key, values in node.items():
+                    if key == '@id' or not _is_array(values):
+                        continue
+                    for value in values:
+                        if key == '@type' or not _is_subject_reference(value):
+                            continue
+                        target = value['@id']
+                        if target == nil_id:
+                            continue
+                        incoming.setdefault(target, []).append(
+                            {
+                                'graph': name,
+                                'node': node['@id'],
+                                'property': key,
+                            }
+                        )
+
+        entries = []
+        for name in graph_order:
+            graph_object = graph_map[name]
+
+            cons = {
+                id_
+                for id_, node in graph_object.items()
+                if id_ != nil_id and (first in node or rest in node)
+            }
+            if not cons:
+                continue
+
+            # Incoming rdf:rest edges inside this graph identify chain heads:
+            # a cons node with at most one such edge is a head. Nodes shared
+            # by two tails have two edges and are reached while walking.
+            incoming_rest = {}
+            for id_ in cons:
+                values = graph_object[id_].get(rest)
+                if not _is_array(values):
+                    continue
+                for value in values:
+                    if _is_subject_reference(value):
+                        incoming_rest.setdefault(value['@id'], []).append(id_)
+
+            visited = set()
+
+            # A cons node starts a chain when it has no incoming rdf:rest
+            # edge, or several (a merge point reached while walking), or a
+            # single edge from a node that is not itself a cons node (a
+            # dangling predecessor).
+            external_heads = sorted(
+                id_
+                for id_ in cons
+                if (
+                    len(incoming_rest.get(id_, [])) != 1
+                    or incoming_rest[id_][0] not in cons
+                )
+            )
+
+            # First walk every chain that has an entry point outside the
+            # cons-node graph. Internal nodes reached during a walk are
+            # removed from the head pool even when they themselves have a
+            # single incoming rdf:rest edge (e.g. the blank suffix of a
+            # named IRI head).
+            for head in external_heads:
+                if head in visited:
+                    continue
+                entries.append(
+                    self._snapshot_one_list_chain(
+                        name,
+                        head,
+                        graph_map,
+                        graph_order,
+                        cons,
+                        incoming,
+                        visited,
+                    )
+                )
+
+            # Remaining unvisited nodes form pure cycles with no external
+            # entry point; each walk marks its component, so report one
+            # entry per component starting at its smallest node id.
+            while cons - visited:
+                head = min(cons - visited)
+                entries.append(
+                    self._snapshot_one_list_chain(
+                        name,
+                        head,
+                        graph_map,
+                        graph_order,
+                        cons,
+                        incoming,
+                        visited,
+                    )
+                )
+
+        return entries
+
+    def _snapshot_one_list_chain(
+        self, name, head, graph_map, graph_order, cons, incoming, visited
+    ):
+        """Walk one candidate chain from `head`, collecting its obstacles."""
+        first = str(RDF.first)
+        rest = str(RDF.rest)
+        type_ = '@type'
+        nil_id = str(RDF.nil)
+        list_type = str(RDF.List)
+
+        graph_object = graph_map[name]
+
+        def obstacle(code, message, node, **details):
+            record = {
+                'code': code,
+                'message': message,
+                'graph': name,
+                'node': node,
+            }
+            if details:
+                record['details'] = details
+            return record
+
+        def static_obstacles(id_, node):
+            found = []
+            first_values = node.get(first)
+            if not _is_array(first_values) or len(first_values) != 1:
+                if _is_array(first_values) and len(first_values) > 1:
+                    found.append(
+                        obstacle(
+                            'multipleFirst',
+                            f'Node {id_} in graph {name} has '
+                            f'{len(first_values)} rdf:first values; a list node '
+                            'must have exactly one.',
+                            id_,
+                            property=first,
+                            count=len(first_values),
+                        )
+                    )
+                else:
+                    found.append(
+                        obstacle(
+                            'missingFirst',
+                            f'Node {id_} in graph {name} is missing a single '
+                            'rdf:first value.',
+                            id_,
+                            property=first,
+                        )
+                    )
+            rest_values = node.get(rest)
+            if not _is_array(rest_values) or len(rest_values) != 1:
+                if _is_array(rest_values) and len(rest_values) > 1:
+                    found.append(
+                        obstacle(
+                            'multipleRest',
+                            f'Node {id_} in graph {name} has '
+                            f'{len(rest_values)} rdf:rest values; a list node '
+                            'must have exactly one.',
+                            id_,
+                            property=rest,
+                            count=len(rest_values),
+                        )
+                    )
+                else:
+                    found.append(
+                        obstacle(
+                            'missingRest',
+                            f'Node {id_} in graph {name} is missing a single '
+                            'rdf:rest value.',
+                            id_,
+                            property=rest,
+                        )
+                    )
+            if type_ in node and (
+                not _is_array(node[type_])
+                or len(node[type_]) != 1
+                or node[type_][0] != list_type
+            ):
+                found.append(
+                    obstacle(
+                        'invalidListType',
+                        f'Node {id_} in graph {name} has a @type other than '
+                        f'{list_type}.',
+                        id_,
+                        property=type_,
+                        types=(
+                            list(node[type_]) if _is_array(node[type_]) else node[type_]
+                        ),
+                    )
+                )
+            extra = sorted(
+                key for key in node if key not in ('@id', first, rest, type_)
+            )
+            if extra:
+                found.append(
+                    obstacle(
+                        'extraProperty',
+                        f'Node {id_} in graph {name} has properties that are '
+                        'not allowed on an rdf:List node.',
+                        id_,
+                        properties=extra,
+                    )
+                )
+            refs = incoming.get(id_, [])
+            other_graph_refs = [ref for ref in refs if ref['graph'] != name]
+            if other_graph_refs:
+                found.append(
+                    obstacle(
+                        'crossGraphReference',
+                        f'Node {id_} in graph {name} is referenced from '
+                        f'{len(other_graph_refs)} triple(s) in other named '
+                        'graph(s); folding it would cross graph boundaries.',
+                        id_,
+                        references=other_graph_refs,
+                    )
+                )
+            if len(refs) > 1:
+                found.append(
+                    obstacle(
+                        'sharedNode',
+                        f'Node {id_} in graph {name} is referenced '
+                        f'{len(refs)} times across the dataset, so folding it '
+                        'would drop a reference.',
+                        id_,
+                        references=refs,
+                    )
+                )
+            elif len(refs) == 0:
+                found.append(
+                    obstacle(
+                        'unreferencedList',
+                        f'Node {id_} in graph {name} is not referenced by any '
+                        'triple, so no @list property could replace it.',
+                        id_,
+                    )
+                )
+            return found
+
+        chain_nodes = []
+        chain_obstacles = []
+        nil_terminated = False
+        nil_confirmed = True
+        in_path = set()
+        chain_visited = set()
+
+        # Iterative DFS so that very long or cyclic chains stay safe.
+        stack = [('enter', head, None)]
+        while stack:
+            action, id_, source = stack.pop()
+            if action == 'exit':
+                in_path.discard(id_)
+                continue
+            if id_ == nil_id:
+                nil_confirmed = True
+                continue
+            if id_ in chain_visited:
+                # A second visit within one chain marks a shared node.
+                if id_ not in in_path:
+                    chain_obstacles.append(
+                        obstacle(
+                            'sharedNode',
+                            f'rdf:rest chain from {head} reaches node {id_} '
+                            'more than once; the node is shared by multiple '
+                            'chain positions.',
+                            id_,
+                            source=source,
+                        )
+                    )
+                continue
+            if id_ not in graph_object or id_ not in cons:
+                target_graph = next(
+                    (
+                        other
+                        for other in graph_order
+                        if other != name and id_ in graph_map[other]
+                    ),
+                    None,
+                )
+                if target_graph is not None:
+                    nil_confirmed = False
+                    chain_obstacles.append(
+                        obstacle(
+                            'crossGraphReference',
+                            f'rdf:rest from {source} in graph {name} points at '
+                            f'{id_}, which is defined in graph {target_graph}; '
+                            'list folding cannot cross named graph boundaries.',
+                            id_,
+                            source=source,
+                            property=rest,
+                            targetGraph=target_graph,
+                        )
+                    )
+                else:
+                    nil_confirmed = False
+                    chain_obstacles.append(
+                        obstacle(
+                            'gap',
+                            f'rdf:rest from {source} in graph {name} points at '
+                            f'{id_}, which is not an rdf:List node.',
+                            id_,
+                            source=source,
+                            property=rest,
+                        )
+                    )
+                continue
+
+            chain_visited.add(id_)
+            visited.add(id_)
+            in_path.add(id_)
+            chain_nodes.append(id_)
+            node_obstacles = static_obstacles(id_, graph_object[id_])
+            # Nodes whose list shape lives in another graph are reported
+            # structurally there, not as broken nodes in this graph.
+            if any(o['code'] == 'crossGraphReference' for o in node_obstacles):
+                node_obstacles = [
+                    o
+                    for o in node_obstacles
+                    if o['code'] in ('crossGraphReference', 'sharedNode')
+                ]
+            chain_obstacles.extend(node_obstacles)
+
+            rest_values = graph_object[id_].get(rest)
+            ordered = (
+                sorted(
+                    rest_values,
+                    key=lambda item: json.dumps(item, sort_keys=True, default=str),
+                )
+                if _is_array(rest_values)
+                else []
+            )
+            stack.append(('exit', id_, None))
+            for value in ordered:
+                if _is_subject_reference(value):
+                    target = value['@id']
+                    if target == nil_id:
+                        nil_confirmed = True
+                    elif target in in_path:
+                        nil_confirmed = False
+                        chain_obstacles.append(
+                            obstacle(
+                                'cycle',
+                                f'rdf:rest from {id_} in graph {name} points '
+                                f'back to {target}, forming a cycle that never '
+                                'reaches rdf:nil.',
+                                target,
+                                source=id_,
+                                property=rest,
+                            )
+                        )
+                    else:
+                        stack.append(('enter', target, id_))
+                else:
+                    nil_confirmed = False
+                    chain_obstacles.append(
+                        obstacle(
+                            'gap',
+                            f'rdf:rest of {id_} in graph {name} is not an IRI '
+                            'or blank node reference.',
+                            id_,
+                            property=rest,
+                            value=value,
+                        )
+                    )
+
+        nil_terminated = nil_confirmed and not any(
+            o['code']
+            in (
+                'gap',
+                'crossGraphReference',
+                'cycle',
+                'missingFirst',
+                'missingRest',
+                'multipleFirst',
+                'multipleRest',
+            )
+            for o in chain_obstacles
+        )
+
+        return {
+            'graph': name,
+            'head': head,
+            'nilTerminated': nil_terminated,
+            'nodes': chain_nodes,
+            'obstacles': chain_obstacles,
+        }
+
+    def _finalize_rdf_list_diagnostics(self, graph_map, snapshot):
+        """
+        Annotate chain snapshots with the result of the folding pass.
+
+        A chain is folded when every blank cons node was consumed; a named
+        (IRI) head is allowed to remain as the chain anchor. Entries are
+        sorted by graph and head.
+        """
+        entries = []
+        for chain in snapshot:
+            name = chain['graph']
+            retained_nodes = [
+                id_
+                for id_ in chain['nodes']
+                if any(id_ in graph_object for graph_object in graph_map.values())
+            ]
+            folded_nodes = [
+                id_
+                for id_ in chain['nodes']
+                if not any(id_ in graph_object for graph_object in graph_map.values())
+            ]
+            blank_retained = [id_ for id_ in retained_nodes if id_.startswith('_:')]
+            folded = (
+                chain['nilTerminated']
+                and not chain['obstacles']
+                and not blank_retained
+                and bool(chain['nodes'])
+            )
+            entries.append(
+                {
+                    'graph': name,
+                    'head': chain['head'],
+                    'folded': folded,
+                    'nilTerminated': chain['nilTerminated'],
+                    'nodes': chain['nodes'],
+                    'foldedNodes': folded_nodes,
+                    'retainedNodes': retained_nodes,
+                    'obstacles': chain['obstacles'],
+                }
+            )
+
+        entries.sort(key=lambda entry: (entry['graph'], entry['head']))
+        return entries
 
     def _rdf_direction_to_compound_literal(self, graph_object):
         """

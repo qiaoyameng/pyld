@@ -213,3 +213,6 @@ class FromRdfOptions(TypedDict, total=False):
 
     rdfDirection: Literal['i18n-datatype', 'compound-literal']
     """Either `i18n-datatype` or `compound-literal` is supported (default: `None`)."""
+
+    listDiagnostics: bool
+    """`True` to return RDF list folding diagnostics alongside the JSON-LD output (default: `False`). When enabled, the result is `{'output': ..., 'listDiagnostics': ...}` with one entry per candidate `rdf:List` chain describing whether it was folded into `@list` and, when not folded, the specific obstacles located by graph name and input node."""
