@@ -52,6 +52,7 @@ from pyld.iri_resolver import resolve, unresolve
 from pyld.options import (
     CompactOptions,
     Context,
+    ExpansionDiagnostic,
     ExpandOptions,
     FlattenOptions,
     FrameOptions,
@@ -72,6 +73,7 @@ __all__ = [
     '__version__',
     'CompactOptions',
     'Context',
+    'ExpansionDiagnostic',
     'ExpandOptions',
     'FlattenOptions',
     'FrameOptions',
@@ -164,6 +166,21 @@ OnPropertyDropped = Callable[[str | None], Any]
 # No-op function to use as default handler and other purposes
 def noop(*args, **kwargs):
     return None
+
+
+def _json_pointer(segments):
+    """
+    Builds an RFC 6901 JSON Pointer from path segments.
+
+    :param segments: the path segments (dict keys and array indices).
+
+    :return: the JSON Pointer string ('' for the document root).
+    """
+    if not segments:
+        return ''
+    return '/' + '/'.join(
+        str(segment).replace('~', '~0').replace('/', '~1') for segment in segments
+    )
 
 
 def compact(input_, ctx: Context, options: CompactOptions | None = None):
@@ -438,6 +455,7 @@ class JsonLdProcessor:
         # processor-specific RDF parsers
         self.rdf_parsers = None
         self.on_property_dropped = on_property_dropped
+        self._diagnostics = None
 
     def compact(self, input_, ctx, options):
         """
@@ -602,6 +620,9 @@ class JsonLdProcessor:
         options.setdefault('extractAllScripts', False)
         options.setdefault('processingMode', 'json-ld-1.1')
 
+        # enable expansion diagnostics if a list was provided
+        self._diagnostics = options.get('expansionDiagnostics')
+
         # if input is a string, attempt to dereference remote document
         if _is_string(input_):
             remote_doc = load_document(input_, options)
@@ -640,19 +661,29 @@ class JsonLdProcessor:
         active_ctx = self._get_initial_context(options)
         document = input_['document']
         remote_context = input_['remoteContext']
+        ctx_sources = ['initial context']
 
         # process optional expandContext
         if 'expandContext' in input_:
             active_ctx = self.process_context(
                 active_ctx, input_['expandContext'], options
             )
+            ctx_sources.append('expandContext option')
 
         # process remote context from HTTP Link Header
         if remote_context is not None:
             active_ctx = self.process_context(active_ctx, remote_context, options)
+            ctx_sources.append("remote context '%s'" % remote_context)
 
         # do expansion
-        expanded = self._expand(active_ctx, None, document, options, inside_list=False)
+        expanded = self._expand(
+            active_ctx,
+            None,
+            document,
+            options,
+            inside_list=False,
+            ctx_sources=tuple(ctx_sources),
+        )
 
         # optimize away @graph with no other properties
         if _is_object(expanded) and '@graph' in expanded and len(expanded) == 1:
@@ -2040,6 +2071,9 @@ class JsonLdProcessor:
         inside_list=False,
         inside_index=False,
         type_scoped_ctx=None,
+        path=(),
+        ctx_sources=(),
+        array_paths=None,
     ):
         """
         Recursively expands an element using the given context. Any context in
@@ -2056,6 +2090,12 @@ class JsonLdProcessor:
         :param type_scoped_ctx: an optional type-scoped active context for
             expanding values of nodes that were expressed according to
             a type-scoped context.
+        :param path: the source document path of the element as a tuple of
+            JSON Pointer segments (diagnostics only).
+        :param ctx_sources: the provenance chain of the active context as a
+            tuple of labels (diagnostics only).
+        :param array_paths: optional per-item source paths to use instead of
+            `path` + index when expanding an array (diagnostics only).
 
         :return: the expanded value.
         """
@@ -2076,16 +2116,21 @@ class JsonLdProcessor:
                 )
             )
             inside_list = inside_list or '@list' in container
-            for e in element:
+            for i, item in enumerate(element):
+                item_path = (
+                    array_paths[i] if array_paths is not None else path + (i,)
+                )
                 # expand element
                 e = self._expand(
                     active_ctx,
                     active_property,
-                    e,
+                    item,
                     options,
                     inside_list=inside_list,
                     inside_index=inside_index,
                     type_scoped_ctx=type_scoped_ctx,
+                    path=item_path,
+                    ctx_sources=ctx_sources,
                 )
                 if inside_list and _is_array(e):
                     e = {'@list': e}
@@ -2095,6 +2140,15 @@ class JsonLdProcessor:
                         rval.extend(e)
                     else:
                         rval.append(e)
+                elif item is None:
+                    self._record_dropped(
+                        item_path,
+                        None,
+                        None,
+                        'nullValue',
+                        'Explicit null array items are dropped.',
+                        ctx_sources,
+                    )
             return rval
 
         # handle scalars
@@ -2104,6 +2158,15 @@ class JsonLdProcessor:
                 active_property is None
                 or self._expand_iri(active_ctx, active_property, vocab=True) == '@graph'
             ):
+                self._record_dropped(
+                    path,
+                    None,
+                    None,
+                    'freeFloatingScalar',
+                    'A scalar without an associated property is dropped; '
+                    'wrap it in an object with a mapped property.',
+                    ctx_sources,
+                )
                 return None
 
             # expand element according to value expansion rules
@@ -2118,6 +2181,10 @@ class JsonLdProcessor:
         property_scoped_ctx = JsonLdProcessor.get_context_value(
             active_ctx, active_property, '@context'
         )
+        if property_scoped_ctx is not None:
+            ctx_sources = ctx_sources + (
+                "scoped context of term '%s'" % active_property,
+            )
 
         # second, determine if any type-scoped context should be reverted; it
         # should only be reverted when the following are all true:
@@ -2155,8 +2222,10 @@ class JsonLdProcessor:
             )
 
         # prepare type-scoped contexts when nested
-        active_ctx, type_key, type_scoped_ctx = self._prepare_nested_context(
-            active_ctx, element, options
+        active_ctx, type_key, type_scoped_ctx, ctx_sources = (
+            self._prepare_nested_context(
+                active_ctx, element, options, path, ctx_sources
+            )
         )
 
         # process each key and value in element, ignoring @nest content
@@ -2171,6 +2240,8 @@ class JsonLdProcessor:
             inside_list,
             type_key,
             type_scoped_ctx,
+            path=path,
+            ctx_sources=ctx_sources,
         )
 
         # get property count on expanded output
@@ -2233,6 +2304,14 @@ class JsonLdProcessor:
                 # any @value is okay if @type: @json
                 rval = rval
             elif rval['@value'] is None:
+                self._record_dropped(
+                    path,
+                    None,
+                    None,
+                    'nullValue',
+                    'A value object with a null "@value" is dropped.',
+                    ctx_sources,
+                )
                 rval = None
             # if @language is present, @value must be a string
             elif '@language' in rval and not all(
@@ -2288,6 +2367,14 @@ class JsonLdProcessor:
                 count = len(rval)
         # drop objects with only @language
         elif count == 1 and '@language' in rval:
+            self._record_dropped(
+                path,
+                None,
+                None,
+                'freeFloatingNode',
+                'An object with only "@language" and no "@value" is dropped.',
+                ctx_sources,
+            )
             rval = None
 
         # drop certain top-level objects that do not occur in lists, or
@@ -2304,9 +2391,83 @@ class JsonLdProcessor:
             or '@list' in rval
             or (count == 1 and '@id' in rval)
         ):
+            self._record_dropped(
+                path,
+                None,
+                None,
+                'freeFloatingNode',
+                'A top-level or "@graph" node that is empty, a value object, '
+                'a list object, or a bare subject reference is dropped; '
+                'nest it under a mapped property to keep it.',
+                ctx_sources,
+            )
             rval = None
 
         return rval
+
+    def _record_dropped(
+        self, path, key, expanded_property, reason, message, ctx_sources
+    ):
+        """
+        Records a diagnostic for a dropped source value, if enabled.
+
+        :param path: the source document path as a tuple of JSON Pointer
+            segments.
+        :param key: the dropped source JSON key, None for bare values.
+        :param expanded_property: the expansion of key, None if it did not
+            expand.
+        :param reason: the machine-readable reason code.
+        :param message: the human-readable explanation.
+        :param ctx_sources: the provenance chain of the active context.
+        """
+        if self._diagnostics is None:
+            return
+        self._diagnostics.append(
+            {
+                'pointer': _json_pointer(path),
+                'key': key,
+                'expandedProperty': expanded_property,
+                'reason': reason,
+                'message': message,
+                'contextSources': list(ctx_sources),
+            }
+        )
+
+    def _dropped_key_reason(self, active_ctx, key, expanded_property):
+        """
+        Determines the reason a key was dropped during expansion.
+
+        :param active_ctx: the active context.
+        :param key: the dropped source JSON key.
+        :param expanded_property: the expansion of key, None if it did not
+            expand.
+
+        :return: a (reason, message) tuple.
+        """
+        if expanded_property is None:
+            if re.match(KEYWORD_PATTERN, key):
+                return (
+                    'unknownKeyword',
+                    '"%s" looks like a keyword but is not defined; it is '
+                    'dropped.' % key,
+                )
+            if key in active_ctx['mappings']:
+                return (
+                    'termMappedToNull',
+                    '"%s" is mapped to null in the active context, so it is '
+                    'intentionally dropped.' % key,
+                )
+            return (
+                'undefinedTerm',
+                '"%s" does not expand; define the term or set "@vocab" in '
+                'the active context.' % key,
+            )
+        return (
+            'nonAbsoluteIri',
+            '"%s" expands to "%s", which is not an absolute IRI or keyword; '
+            'define the term or set "@vocab" in the active context.'
+            % (key, expanded_property),
+        )
 
     def _expand_object(
         self,
@@ -2319,6 +2480,8 @@ class JsonLdProcessor:
         inside_list=False,
         type_key=None,
         type_scoped_ctx=None,
+        path=(),
+        ctx_sources=(),
     ):
         """
         Expand each key and value of element adding to result.
@@ -2330,6 +2493,10 @@ class JsonLdProcessor:
         :param expanded_parent: the expanded result into which to add values.
         :param options: the expansion options.
         :param inside_list: True if the property is a list, False if not.
+        :param path: the source document path of the element as a tuple of
+            JSON Pointer segments (diagnostics only).
+        :param ctx_sources: the provenance chain of the active context as a
+            tuple of labels (diagnostics only).
 
         :return: the expanded value.
         """
@@ -2358,6 +2525,13 @@ class JsonLdProcessor:
             ):
                 # call handler with dropped key
                 self.on_property_dropped(expanded_property)
+                self._record_dropped(
+                    path + (key,),
+                    key,
+                    expanded_property,
+                    *self._dropped_key_reason(active_ctx, key, expanded_property),
+                    ctx_sources,
+                )
                 continue
 
             if _is_keyword(expanded_property):
@@ -2481,7 +2655,14 @@ class JsonLdProcessor:
                 active_ctx, 1.1
             ):
                 included_result = JsonLdProcessor.arrayify(
-                    self._expand(active_ctx, active_property, value, options)
+                    self._expand(
+                        active_ctx,
+                        active_property,
+                        value,
+                        options,
+                        path=path + (key,),
+                        ctx_sources=ctx_sources,
+                    )
                 )
                 if not all(_is_subject(v) for v in included_result):
                     raise JsonLdError(
@@ -2599,7 +2780,13 @@ class JsonLdProcessor:
                     )
 
                 expanded_value = self._expand(
-                    active_ctx, '@reverse', value, options, inside_list=inside_list
+                    active_ctx,
+                    '@reverse',
+                    value,
+                    options,
+                    inside_list=inside_list,
+                    path=path + (key,),
+                    ctx_sources=ctx_sources,
                 )
 
                 # properties double-reversed
@@ -2640,14 +2827,18 @@ class JsonLdProcessor:
             # use potential scoped context for key
             term_ctx = active_ctx
             ctx = JsonLdProcessor.get_context_value(active_ctx, key, '@context')
+            value_ctx_sources = ctx_sources
             if ctx is not None:
                 term_ctx = self._process_context(
                     active_ctx, ctx, options, propagate=True, override_protected=True
                 )
+                value_ctx_sources = ctx_sources + (
+                    "scoped context of term '%s'" % key,
+                )
 
             # for nested keys, add scoped context with key
             if expanded_property == '@nest':
-                nests.append((key, term_ctx))
+                nests.append((key, term_ctx, value_ctx_sources))
                 continue
 
             container = JsonLdProcessor.arrayify(
@@ -2659,7 +2850,13 @@ class JsonLdProcessor:
                 direction = JsonLdProcessor.get_context_value(
                     active_ctx, key, '@direction'
                 )
-                expanded_value = self._expand_language_map(term_ctx, value, direction)
+                expanded_value = self._expand_language_map(
+                    term_ctx,
+                    value,
+                    direction,
+                    path=path + (key,),
+                    ctx_sources=value_ctx_sources,
+                )
             # handle index container (skip if value is not an object)
             elif '@index' in container and _is_object(value):
                 index_key = JsonLdProcessor.get_context_value(term_ctx, key, '@index')
@@ -2678,10 +2875,20 @@ class JsonLdProcessor:
                     '@graph' in container,
                     property_index,
                     options,
+                    path=path + (key,),
+                    ctx_sources=value_ctx_sources,
                 )
             elif '@id' in container and _is_object(value):
                 expanded_value = self._expand_index_map(
-                    term_ctx, key, value, '@id', '@graph' in container, None, options
+                    term_ctx,
+                    key,
+                    value,
+                    '@id',
+                    '@graph' in container,
+                    None,
+                    options,
+                    path=path + (key,),
+                    ctx_sources=value_ctx_sources,
                 )
             elif '@type' in container and _is_object(value):
                 expanded_value = self._expand_index_map(
@@ -2692,6 +2899,8 @@ class JsonLdProcessor:
                     False,
                     None,
                     options,
+                    path=path + (key,),
+                    ctx_sources=value_ctx_sources,
                 )
             else:
                 # recurse into @list or @set
@@ -2706,6 +2915,8 @@ class JsonLdProcessor:
                         value,
                         options,
                         inside_list=is_list,
+                        path=path + (key,),
+                        ctx_sources=value_ctx_sources,
                     )
                 elif (
                     JsonLdProcessor.get_context_value(active_ctx, key, '@type')
@@ -2715,11 +2926,26 @@ class JsonLdProcessor:
                 else:
                     # recursively expand value w/key as new active property
                     expanded_value = self._expand(
-                        term_ctx, key, value, options, inside_list=False
+                        term_ctx,
+                        key,
+                        value,
+                        options,
+                        inside_list=False,
+                        path=path + (key,),
+                        ctx_sources=value_ctx_sources,
                     )
 
             # drop None values if property is not @value (dropped below)
             if expanded_value is None and expanded_property != '@value':
+                if value is None:
+                    self._record_dropped(
+                        path + (key,),
+                        key,
+                        expanded_property,
+                        'nullValue',
+                        'Explicit null values are dropped.',
+                        value_ctx_sources,
+                    )
                 continue
 
             # convert expanded value to @list if container specifies it
@@ -2797,8 +3023,10 @@ class JsonLdProcessor:
 
         # Nested values merge into the current node, but their term and type
         # scoped contexts must still be prepared as if expanding a node object.
-        for key, term_ctx in nests:
-            for nv in JsonLdProcessor.arrayify(element[key]):
+        for key, term_ctx, nest_ctx_sources in nests:
+            nest_value = element[key]
+            for i, nv in enumerate(JsonLdProcessor.arrayify(nest_value)):
+                nv_path = path + (key, i) if _is_array(nest_value) else path + (key,)
                 if not _is_object(nv):
                     raise JsonLdError(
                         'Invalid JSON-LD syntax; nested value must be a node object.',
@@ -2808,8 +3036,10 @@ class JsonLdProcessor:
                     )
 
                 # prepare type-scoped contexts when nested
-                active_ctx, type_key, type_scoped_ctx = self._prepare_nested_context(
-                    term_ctx, nv, options
+                active_ctx, type_key, type_scoped_ctx, nv_ctx_sources = (
+                    self._prepare_nested_context(
+                        term_ctx, nv, options, nv_path, nest_ctx_sources
+                    )
                 )
 
                 if any(
@@ -2833,9 +3063,13 @@ class JsonLdProcessor:
                     inside_list=inside_list,
                     type_key=type_key,
                     type_scoped_ctx=type_scoped_ctx,
+                    path=nv_path,
+                    ctx_sources=nv_ctx_sources,
                 )
 
-    def _prepare_nested_context(self, active_ctx, element, options):
+    def _prepare_nested_context(
+        self, active_ctx, element, options, path=(), ctx_sources=()
+    ):
         """
         Prepare local and type-scoped contexts for a nested node object.
 
@@ -2843,6 +3077,14 @@ class JsonLdProcessor:
         are merged into the parent node. Context processing is not transparent:
         a scoped context on the nest term must be active while discovering any
         @type entries and applying the type-scoped contexts they reference.
+
+        :param path: the source document path of the element as a tuple of
+            JSON Pointer segments (diagnostics only).
+        :param ctx_sources: the provenance chain of the active context as a
+            tuple of labels (diagnostics only).
+
+        :return: the active context, the @type key, the type-scoped context,
+            and the updated context source provenance chain.
         """
         # Recursively expand object: process context if element has one
         # Local contexts on the nested node apply before looking for @type,
@@ -2861,6 +3103,15 @@ class JsonLdProcessor:
                     code='keyword redefinition',
                 )
             active_ctx = self._process_context(active_ctx, local_ctx, options)
+            if _is_string(local_ctx):
+                ctx_sources = ctx_sources + (
+                    "remote context '%s'" % local_ctx,
+                )
+            else:
+                ctx_sources = ctx_sources + (
+                    "local @context at '%s'"
+                    % _json_pointer(path + ('@context',)),
+                )
 
         # Set the type-scoped context to the context on input, for use later
         type_scoped_ctx = active_ctx
@@ -2889,8 +3140,11 @@ class JsonLdProcessor:
                     active_ctx = self._process_context(
                         active_ctx, ctx, options, propagate=False
                     )
+                    ctx_sources = ctx_sources + (
+                        "type-scoped context of type '%s'" % type_,
+                    )
 
-        return active_ctx, type_key, type_scoped_ctx
+        return active_ctx, type_key, type_scoped_ctx, ctx_sources
 
     def _flatten(self, input, options):
         """
@@ -3674,22 +3928,42 @@ class JsonLdProcessor:
                 code='invalid @nest value',
             )
 
-    def _expand_language_map(self, active_ctx, language_map, direction):
+    def _expand_language_map(
+        self, active_ctx, language_map, direction, path=(), ctx_sources=()
+    ):
         """
         Expands a language map.
 
         :param active_ctx: the current active context.
         :param language_map: the language map to expand.
         :param direction the direction to apply to values.
+        :param path: the source document path of the language map as a tuple
+            of JSON Pointer segments (diagnostics only).
+        :param ctx_sources: the provenance chain of the active context as a
+            tuple of labels (diagnostics only).
 
         :return: the expanded language map.
         """
         rval = []
         for key, values in sorted(language_map.items()):
             expanded_key = self._expand_iri(active_ctx, key, vocab=True)
+            raw_values = values
             values = JsonLdProcessor.arrayify(values)
-            for item in values:
+            for i, item in enumerate(values):
+                item_path = (
+                    path + (key, i)
+                    if _is_array(raw_values)
+                    else path + (key,)
+                )
                 if item is None:
+                    self._record_dropped(
+                        item_path,
+                        None,
+                        None,
+                        'nullValue',
+                        'Explicit null language map values are dropped.',
+                        ctx_sources,
+                    )
                     continue
                 if not _is_string(item):
                     raise JsonLdError(
@@ -3715,6 +3989,8 @@ class JsonLdProcessor:
         as_graph,
         property_index,
         options,
+        path=(),
+        ctx_sources=(),
     ):
         """
         Expands in index, id or type map.
@@ -3725,6 +4001,10 @@ class JsonLdProcessor:
         :param index_key: the key value used to index
         :param as_graph: contents should form a named graph
         :param property_index: index is a property
+        :param path: the source document path of the map as a tuple of JSON
+            Pointer segments (diagnostics only).
+        :param ctx_sources: the provenance chain of the active context as a
+            tuple of labels (diagnostics only).
         """
         rval = []
         is_type_index = index_key == '@type'
@@ -3735,14 +4015,25 @@ class JsonLdProcessor:
                     active_ctx = self._process_context(
                         active_ctx, ctx, options, propagate=False
                     )
+                    ctx_sources = ctx_sources + (
+                        "type-scoped context of type '%s'" % k,
+                    )
 
+            map_value = JsonLdProcessor.arrayify(v)
+            if _is_array(v):
+                item_paths = tuple(path + (k, i) for i in range(len(map_value)))
+            else:
+                item_paths = (path + (k,),)
             v = self._expand(
                 active_ctx,
                 active_property,
-                JsonLdProcessor.arrayify(v),
+                map_value,
                 options,
                 inside_list=False,
                 inside_index=True,
+                path=path + (k,),
+                ctx_sources=ctx_sources,
+                array_paths=item_paths,
             )
 
             expanded_key = None

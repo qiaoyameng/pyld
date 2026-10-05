@@ -84,6 +84,44 @@ class ExpandOptions(ExpandContextOptions, total=False):
     expandContext: Context
     """A context to expand with."""
 
+    expansionDiagnostics: list['ExpansionDiagnostic']
+    """A list that receives an `ExpansionDiagnostic` entry for every source
+    value dropped during expansion (default: diagnostics disabled). Each entry
+    locates the dropped data in the source document and explains why it was
+    dropped. Diagnostics are observational only: the expanded output is
+    identical whether or not this option is set."""
+
+
+class ExpansionDiagnostic(TypedDict):
+    """A diagnostic describing a source value dropped during expansion."""
+
+    pointer: str
+    """JSON Pointer (RFC 6901) to the dropped key or value in the source
+    document, e.g. `/items/0/name`. Reflects the original document structure,
+    including `@nest`, `@list`, and index map levels; it is not an expanded
+    IRI path."""
+
+    key: str | None
+    """The source JSON key that was dropped, or `None` when a bare array item
+    or scalar was dropped."""
+
+    expandedProperty: str | None
+    """The result of expanding `key` against the active context, or `None` if
+    it did not expand."""
+
+    reason: str
+    """Machine-readable reason code: `undefinedTerm`, `termMappedToNull`,
+    `unknownKeyword`, `nonAbsoluteIri`, `nullValue`, `freeFloatingScalar`, or
+    `freeFloatingNode`."""
+
+    message: str
+    """Human-readable explanation of why the value was dropped."""
+
+    contextSources: list[str]
+    """The provenance chain of the context in effect when the value was
+    dropped, e.g. the initial context, the `expandContext` option, a remote
+    context URL, a local `@context`, or a term- or type-scoped context."""
+
 
 class FlattenOptions(ExpandContextOptions, total=False):
     documentLoader: DocumentLoader | DocumentLoaderCallable

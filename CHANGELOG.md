@@ -4,6 +4,12 @@
 
 ### Added
 
+- Added the `expansionDiagnostics` option to `jsonld.expand()`. When a list is
+  passed, it receives an `ExpansionDiagnostic` for every source value dropped
+  during expansion, with an RFC 6901 JSON Pointer into the source document, a
+  reason code, and the provenance chain of the context in effect. Diagnostics
+  are observational only and do not change expansion output; the legacy
+  `on_property_dropped` handler is unchanged.
 - Migrate `canon.py` to `rdflib`
   - Added `rdflib` dependency in all relevant config and code files.
   - Added `util.py`:

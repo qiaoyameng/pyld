@@ -1,6 +1,19 @@
 import pytest
 
 import pyld.jsonld as jsonld
+from pyld.documentloader.base import DocumentLoader
+
+
+def _resolve_pointer(document, pointer):
+    """Resolve an RFC 6901 JSON Pointer against a document."""
+    node = document
+    for segment in pointer.split('/')[1:]:
+        segment = segment.replace('~1', '/').replace('~0', '~')
+        if isinstance(node, list):
+            node = node[int(segment)]
+        else:
+            node = node[segment]
+    return node
 
 
 def raise_this(value):
@@ -568,6 +581,242 @@ def test_blank_node_prefixes():
     expanded = jsonld.expand(input)
 
     assert expanded == expected
+
+
+def test_expansion_diagnostics_disabled_by_default():
+    """
+    Without the expansionDiagnostics option, expand returns the expanded
+    output only and requires no diagnostics list.
+    """
+    input = {"fooo": "bar"}
+    context = {"foo": {"@id": "http://example.com/foo"}}
+    got = jsonld.expand(input, {"expandContext": context, "base": None})
+    assert got == []
+
+
+def test_expansion_diagnostics_escaped_key_pointers():
+    """
+    Diagnostics locate dropped keys with special characters using
+    RFC 6901-escaped JSON Pointers into the source document.
+    """
+    input = {
+        "@context": {"ex": "http://example.com/", "name": "ex:name"},
+        "name": "kept",
+        "unknown/key~x": "dropped",
+    }
+    diagnostics = []
+    jsonld.expand(input, {"expansionDiagnostics": diagnostics})
+
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic["pointer"] == "/unknown~1key~0x"
+    assert diagnostic["key"] == "unknown/key~x"
+    assert diagnostic["reason"] == "nonAbsoluteIri"
+    # the pointer resolves back to the dropped value in the source document
+    assert _resolve_pointer(input, diagnostic["pointer"]) == "dropped"
+
+
+def test_expansion_diagnostics_arrays_lists_and_nest():
+    """
+    Diagnostics paths traverse arrays, @list containers, and @nest using
+    source document structure, not expanded IRI paths.
+    """
+    input = {
+        "@context": {
+            "ex": "http://example.com/",
+            "name": "ex:name",
+            "items": {"@id": "ex:items", "@container": "@list"},
+            "nested": {"@id": "@nest"},
+        },
+        "items": [{"name": "kept"}, {"bad": "dropped"}],
+        "nested": {"name": "also kept", "ghost": "dropped"},
+    }
+    diagnostics = []
+    expanded = jsonld.expand(input, {"expansionDiagnostics": diagnostics})
+
+    pointers = {d["pointer"] for d in diagnostics}
+    assert pointers == {"/items/1/bad", "/nested/ghost"}
+    for diagnostic in diagnostics:
+        assert _resolve_pointer(input, diagnostic["pointer"]) == "dropped"
+    # @nest content still merges into the parent node in the output
+    assert expanded == [
+        {
+            "http://example.com/items": [
+                {"@list": [{"http://example.com/name": [{"@value": "kept"}]}, {}]}
+            ],
+            "http://example.com/name": [{"@value": "also kept"}],
+        }
+    ]
+
+
+def test_expansion_diagnostics_index_map():
+    """
+    Diagnostics paths traverse index map containers using the source map keys.
+    """
+    input = {
+        "@context": {
+            "ex": "http://example.com/",
+            "tags": {"@id": "ex:tags", "@container": "@index"},
+        },
+        "tags": {"t1": {"phantom": "dropped"}},
+    }
+    diagnostics = []
+    jsonld.expand(input, {"expansionDiagnostics": diagnostics})
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["pointer"] == "/tags/t1/phantom"
+    assert _resolve_pointer(input, diagnostics[0]["pointer"]) == "dropped"
+
+
+def test_expansion_diagnostics_type_scoped_contexts():
+    """
+    The same key can be valid under one type-scoped context and dropped
+    under another; diagnostics report only the dropped occurrence with the
+    type-scoped context in its provenance chain.
+    """
+    input = {
+        "@context": {
+            "ex": "http://example.com/",
+            "a": "ex:a",
+            "b": "ex:b",
+            "TypeA": {"@id": "ex:TypeA", "@context": {"label": "ex:labelA"}},
+            "TypeB": {"@id": "ex:TypeB", "@context": {"other": "ex:other"}},
+        },
+        "a": {"@type": "TypeA", "label": "kept"},
+        "b": {"@type": "TypeB", "label": "dropped"},
+    }
+    diagnostics = []
+    expanded = jsonld.expand(input, {"expansionDiagnostics": diagnostics})
+
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic["pointer"] == "/b/label"
+    assert diagnostic["key"] == "label"
+    assert "type-scoped context of type 'TypeB'" in diagnostic["contextSources"]
+    # the TypeA-scoped label was kept
+    node_a = expanded[0]["http://example.com/a"][0]
+    assert node_a["http://example.com/labelA"] == [{"@value": "kept"}]
+
+
+def test_expansion_diagnostics_reason_codes():
+    """
+    Diagnostics distinguish unmapped terms, terms mapped to null, relative
+    IRIs, and explicit null values.
+    """
+    input = {
+        "@context": {
+            "ex": "http://example.com/",
+            "name": "ex:name",
+            "skip": None,
+        },
+        "name": None,
+        "skip": "dropped",
+        "relative": "dropped",
+    }
+    diagnostics = []
+    jsonld.expand(input, {"expansionDiagnostics": diagnostics})
+
+    by_key = {d["key"]: d for d in diagnostics}
+    assert by_key["name"]["reason"] == "nullValue"
+    assert by_key["name"]["expandedProperty"] == "http://example.com/name"
+    assert by_key["skip"]["reason"] == "termMappedToNull"
+    assert by_key["skip"]["expandedProperty"] is None
+    assert by_key["relative"]["reason"] == "nonAbsoluteIri"
+
+
+def test_expansion_diagnostics_do_not_change_output():
+    """
+    Enabling diagnostics must not change expansion output, including null
+    and relative IRI handling.
+    """
+    input = {
+        "@context": {"ex": "http://example.com/", "name": "ex:name"},
+        "@id": "relative/id",
+        "name": "kept",
+        "unknown": "dropped",
+        "also_unknown": None,
+    }
+    diagnostics = []
+    with_diagnostics = jsonld.expand(input, {"expansionDiagnostics": diagnostics})
+    without_diagnostics = jsonld.expand(input)
+
+    assert with_diagnostics == without_diagnostics
+    assert {d["key"] for d in diagnostics} == {"unknown", "also_unknown"}
+
+
+def test_expansion_diagnostics_valid_fields_not_reported():
+    """
+    Fully mapped documents produce no diagnostics.
+    """
+    input = {
+        "@context": {"ex": "http://example.com/", "name": "ex:name"},
+        "@id": "ex:1",
+        "name": "kept",
+    }
+    diagnostics = []
+    expanded = jsonld.expand(input, {"expansionDiagnostics": diagnostics})
+
+    assert diagnostics == []
+    assert expanded == [
+        {
+            "@id": "http://example.com/1",
+            "http://example.com/name": [{"@value": "kept"}],
+        }
+    ]
+
+
+def test_expansion_diagnostics_compatible_with_on_property_dropped():
+    """
+    The legacy on_property_dropped handler still fires alongside diagnostics.
+    """
+    input = {"fooo": "bar"}
+    context = {"foo": {"@id": "http://example.com/foo"}}
+    dropped_keys = set()
+    diagnostics = []
+    got = jsonld.expand(
+        input,
+        {"expandContext": context, "base": None, "expansionDiagnostics": diagnostics},
+        on_property_dropped=dropped_keys.add,
+    )
+    assert got == []
+    assert dropped_keys == {"fooo"}
+    key_diagnostics = [d for d in diagnostics if d["key"] == "fooo"]
+    assert len(key_diagnostics) == 1
+    assert key_diagnostics[0]["pointer"] == "/fooo"
+
+
+def test_expansion_diagnostics_remote_context_source():
+    """
+    Remote contexts are loaded through the existing documentLoader protocol,
+    and diagnostics record the remote context URL as the context source.
+    """
+
+    class FakeLoader(DocumentLoader):
+        def __call__(self, url, options):
+            return {
+                "contextUrl": None,
+                "documentUrl": url,
+                "document": {"@context": {"name": "http://example.com/name"}},
+            }
+
+    input = {
+        "@context": "http://example.com/ctx",
+        "name": "kept",
+        "unknown": "dropped",
+    }
+    diagnostics = []
+    expanded = jsonld.expand(
+        input,
+        {"expansionDiagnostics": diagnostics, "documentLoader": FakeLoader()},
+    )
+
+    assert expanded == [{"http://example.com/name": [{"@value": "kept"}]}]
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["pointer"] == "/unknown"
+    assert (
+        "remote context 'http://example.com/ctx'"
+        in diagnostics[0]["contextSources"]
+    )
 
 
 # Issue 337
