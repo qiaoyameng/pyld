@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added a `sourceMap` option to `jsonld.to_rdf()`. When `True`, `to_rdf()` returns a `(result, source_map)` tuple where the source map associates each generated RDF statement with the set of JSON Pointers (RFC 6901) into the input document that produced it, without changing blank node allocation or statement content.
 - Migrate `canon.py` to `rdflib`
   - Added `rdflib` dependency in all relevant config and code files.
   - Added `util.py`:

@@ -200,6 +200,19 @@ class ToRdfOptions(ProcessingOptions, total=False):
     legacyMode: bool
     """`True` to return the RDF.js-like dataset `dict` used by PyLD versions lower than 4 instead of an `rdflib.Dataset` when `format` is not set (default: `False`)."""
 
+    sourceMap: bool
+    """`True` to also return a source map, `False` not to (default: `False`).
+
+    When `True`, `to_rdf()` returns a `(result, source_map)` tuple. The
+    source map maps each generated RDF statement, keyed by
+    `(subject, predicate, object, graph)` (`graph` is `None` for the default
+    graph), to the set of JSON Pointers (RFC 6901) into the input document
+    that the statement originates from. A statement synthesized from several
+    input positions maps to all of them, and structural statements generated
+    for `@list` containers map to the container. The main result keeps its
+    original format and is identical to the result without a source map.
+    """
+
 
 class FromRdfOptions(TypedDict, total=False):
     format: Literal['application/n-quads']
