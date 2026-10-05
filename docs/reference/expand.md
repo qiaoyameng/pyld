@@ -12,6 +12,20 @@
       show_bases: false
       heading_level: 3
 
+## Diagnostics
+
+::: pyld.options.ExpansionDiagnostic
+    options:
+      show_root_heading: false
+      show_bases: false
+      heading_level: 3
+
+::: pyld.options.ContextSource
+    options:
+      show_root_heading: false
+      show_bases: false
+      heading_level: 3
+
 ## Example
 
 {{ example('expand.py', 'json') }}

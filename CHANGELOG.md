@@ -4,6 +4,15 @@
 
 ### Added
 
+- Added optional expansion diagnostics: pass a `diagnostics` list in the
+  `ExpandOptions` of `jsonld.expand()` to receive an `ExpansionDiagnostic` for
+  each source field dropped during expansion. Each diagnostic carries the
+  field's RFC 6901 JSON Pointer in the source document, the layered origin of
+  the active context (`initial`, `expandContext`, `remote`, `local`,
+  `property-scoped`, `term-scoped`, `type-scoped`), and the drop reason
+  (`undefined term`, `not an absolute IRI`, `null value`). The expanded output
+  and the `on_property_dropped` callback are unchanged whether or not
+  diagnostics are collected.
 - Migrate `canon.py` to `rdflib`
   - Added `rdflib` dependency in all relevant config and code files.
   - Added `util.py`:

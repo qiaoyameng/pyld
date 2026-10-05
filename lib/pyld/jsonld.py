@@ -166,6 +166,45 @@ def noop(*args, **kwargs):
     return None
 
 
+def _json_pointer(segments):
+    """
+    Renders path segments as an RFC 6901 JSON Pointer.
+
+    :param segments: the path segments (object keys and array indices).
+
+    :return: the JSON Pointer string.
+    """
+    return ''.join(
+        '/' + str(segment).replace('~', '~0').replace('/', '~1')
+        for segment in segments
+    )
+
+
+class _ExpansionLocation:
+    """
+    Tracks the source-document location of the element being expanded and the
+    origin of the active context, for expansion diagnostics.
+    """
+
+    __slots__ = ('path', 'context_source')
+
+    def __init__(self, path=(), context_source=()):
+        self.path = path
+        self.context_source = context_source
+
+    def child(self, segment):
+        """
+        Returns the location of a child element or key of the source document.
+        """
+        return _ExpansionLocation(self.path + (segment,), self.context_source)
+
+    def with_context(self, source):
+        """
+        Returns this location with an additional active context layer.
+        """
+        return _ExpansionLocation(self.path, self.context_source + (source,))
+
+
 def compact(input_, ctx: Context, options: CompactOptions | None = None):
     """
     Performs JSON-LD compaction.
@@ -652,7 +691,14 @@ class JsonLdProcessor:
             active_ctx = self.process_context(active_ctx, remote_context, options)
 
         # do expansion
-        expanded = self._expand(active_ctx, None, document, options, inside_list=False)
+        expanded = self._expand(
+            active_ctx,
+            None,
+            document,
+            options,
+            inside_list=False,
+            location=self._root_location(input_, remote_context, options),
+        )
 
         # optimize away @graph with no other properties
         if _is_object(expanded) and '@graph' in expanded and len(expanded) == 1:
@@ -2031,6 +2077,48 @@ class JsonLdProcessor:
         # only primitives remain which are already compact
         return element
 
+    def _root_location(self, input_, remote_context, options):
+        """
+        Builds the root expansion location for diagnostics, or None if
+        diagnostics are disabled.
+
+        :param input_: the expansion input meta-object.
+        :param remote_context: the remote context URL from an HTTP Link
+            header, if any.
+        :param options: the expansion options.
+
+        :return: the root _ExpansionLocation or None.
+        """
+        if options.get('diagnostics') is None:
+            return None
+        context_source = [{'kind': 'initial'}]
+        if 'expandContext' in input_:
+            context_source.append({'kind': 'expandContext'})
+        if remote_context is not None:
+            context_source.append({'kind': 'remote', 'url': remote_context})
+        return _ExpansionLocation(context_source=tuple(context_source))
+
+    def _record_diagnostic(self, options, location, key, reason, expanded_property):
+        """
+        Records a dropped-field diagnostic into the diagnostics list from the
+        expansion options.
+
+        :param options: the expansion options.
+        :param location: the _ExpansionLocation of the dropped field.
+        :param key: the original JSON key, or None for an array item.
+        :param reason: the reason the field was dropped.
+        :param expanded_property: the result of expanding the key.
+        """
+        options['diagnostics'].append(
+            {
+                'pointer': _json_pointer(location.path),
+                'key': key,
+                'reason': reason,
+                'expandedProperty': expanded_property,
+                'contextSource': [dict(source) for source in location.context_source],
+            }
+        )
+
     def _expand(
         self,
         active_ctx,
@@ -2040,6 +2128,7 @@ class JsonLdProcessor:
         inside_list=False,
         inside_index=False,
         type_scoped_ctx=None,
+        location=None,
     ):
         """
         Recursively expands an element using the given context. Any context in
@@ -2056,6 +2145,8 @@ class JsonLdProcessor:
         :param type_scoped_ctx: an optional type-scoped active context for
             expanding values of nodes that were expressed according to
             a type-scoped context.
+        :param location: an optional _ExpansionLocation tracking the
+            source-document path and context origin for diagnostics.
 
         :return: the expanded value.
         """
@@ -2076,7 +2167,7 @@ class JsonLdProcessor:
                 )
             )
             inside_list = inside_list or '@list' in container
-            for e in element:
+            for i, e in enumerate(element):
                 # expand element
                 e = self._expand(
                     active_ctx,
@@ -2086,6 +2177,7 @@ class JsonLdProcessor:
                     inside_list=inside_list,
                     inside_index=inside_index,
                     type_scoped_ctx=type_scoped_ctx,
+                    location=location.child(i) if location else None,
                 )
                 if inside_list and _is_array(e):
                     e = {'@list': e}
@@ -2153,10 +2245,14 @@ class JsonLdProcessor:
             active_ctx = self._process_context(
                 active_ctx, property_scoped_ctx, options, override_protected=True
             )
+            if location is not None:
+                location = location.with_context(
+                    {'kind': 'property-scoped', 'term': active_property}
+                )
 
         # prepare type-scoped contexts when nested
-        active_ctx, type_key, type_scoped_ctx = self._prepare_nested_context(
-            active_ctx, element, options
+        active_ctx, type_key, type_scoped_ctx, location = (
+            self._prepare_nested_context(active_ctx, element, options, location)
         )
 
         # process each key and value in element, ignoring @nest content
@@ -2171,6 +2267,7 @@ class JsonLdProcessor:
             inside_list,
             type_key,
             type_scoped_ctx,
+            location=location,
         )
 
         # get property count on expanded output
@@ -2319,6 +2416,7 @@ class JsonLdProcessor:
         inside_list=False,
         type_key=None,
         type_scoped_ctx=None,
+        location=None,
     ):
         """
         Expand each key and value of element adding to result.
@@ -2330,6 +2428,8 @@ class JsonLdProcessor:
         :param expanded_parent: the expanded result into which to add values.
         :param options: the expansion options.
         :param inside_list: True if the property is a list, False if not.
+        :param location: an optional _ExpansionLocation tracking the
+            source-document path and context origin for diagnostics.
 
         :return: the expanded value.
         """
@@ -2358,6 +2458,17 @@ class JsonLdProcessor:
             ):
                 # call handler with dropped key
                 self.on_property_dropped(expanded_property)
+                if location is not None:
+                    if expanded_property is None or (
+                        key not in active_ctx['mappings']
+                        and '@vocab' not in active_ctx
+                    ):
+                        reason = 'undefined term'
+                    else:
+                        reason = 'not an absolute IRI'
+                    self._record_diagnostic(
+                        options, location.child(key), key, reason, expanded_property
+                    )
                 continue
 
             if _is_keyword(expanded_property):
@@ -2481,7 +2592,13 @@ class JsonLdProcessor:
                 active_ctx, 1.1
             ):
                 included_result = JsonLdProcessor.arrayify(
-                    self._expand(active_ctx, active_property, value, options)
+                    self._expand(
+                        active_ctx,
+                        active_property,
+                        value,
+                        options,
+                        location=location.child(key) if location else None,
+                    )
                 )
                 if not all(_is_subject(v) for v in included_result):
                     raise JsonLdError(
@@ -2599,7 +2716,12 @@ class JsonLdProcessor:
                     )
 
                 expanded_value = self._expand(
-                    active_ctx, '@reverse', value, options, inside_list=inside_list
+                    active_ctx,
+                    '@reverse',
+                    value,
+                    options,
+                    inside_list=inside_list,
+                    location=location.child(key) if location else None,
                 )
 
                 # properties double-reversed
@@ -2645,9 +2767,18 @@ class JsonLdProcessor:
                     active_ctx, ctx, options, propagate=True, override_protected=True
                 )
 
+            # location of the value, under any term-scoped context
+            value_location = None
+            if location is not None:
+                value_location = location.child(key)
+                if ctx is not None:
+                    value_location = value_location.with_context(
+                        {'kind': 'term-scoped', 'term': key}
+                    )
+
             # for nested keys, add scoped context with key
             if expanded_property == '@nest':
-                nests.append((key, term_ctx))
+                nests.append((key, term_ctx, value_location))
                 continue
 
             container = JsonLdProcessor.arrayify(
@@ -2659,7 +2790,9 @@ class JsonLdProcessor:
                 direction = JsonLdProcessor.get_context_value(
                     active_ctx, key, '@direction'
                 )
-                expanded_value = self._expand_language_map(term_ctx, value, direction)
+                expanded_value = self._expand_language_map(
+                    term_ctx, value, direction, options, location=value_location
+                )
             # handle index container (skip if value is not an object)
             elif '@index' in container and _is_object(value):
                 index_key = JsonLdProcessor.get_context_value(term_ctx, key, '@index')
@@ -2678,10 +2811,18 @@ class JsonLdProcessor:
                     '@graph' in container,
                     property_index,
                     options,
+                    location=value_location,
                 )
             elif '@id' in container and _is_object(value):
                 expanded_value = self._expand_index_map(
-                    term_ctx, key, value, '@id', '@graph' in container, None, options
+                    term_ctx,
+                    key,
+                    value,
+                    '@id',
+                    '@graph' in container,
+                    None,
+                    options,
+                    location=value_location,
                 )
             elif '@type' in container and _is_object(value):
                 expanded_value = self._expand_index_map(
@@ -2692,6 +2833,7 @@ class JsonLdProcessor:
                     False,
                     None,
                     options,
+                    location=value_location,
                 )
             else:
                 # recurse into @list or @set
@@ -2706,6 +2848,7 @@ class JsonLdProcessor:
                         value,
                         options,
                         inside_list=is_list,
+                        location=value_location,
                     )
                 elif (
                     JsonLdProcessor.get_context_value(active_ctx, key, '@type')
@@ -2715,11 +2858,20 @@ class JsonLdProcessor:
                 else:
                     # recursively expand value w/key as new active property
                     expanded_value = self._expand(
-                        term_ctx, key, value, options, inside_list=False
+                        term_ctx,
+                        key,
+                        value,
+                        options,
+                        inside_list=False,
+                        location=value_location,
                     )
 
             # drop None values if property is not @value (dropped below)
             if expanded_value is None and expanded_property != '@value':
+                if location is not None:
+                    self._record_diagnostic(
+                        options, value_location, key, 'null value', expanded_property
+                    )
                 continue
 
             # convert expanded value to @list if container specifies it
@@ -2797,8 +2949,8 @@ class JsonLdProcessor:
 
         # Nested values merge into the current node, but their term and type
         # scoped contexts must still be prepared as if expanding a node object.
-        for key, term_ctx in nests:
-            for nv in JsonLdProcessor.arrayify(element[key]):
+        for key, term_ctx, nest_location in nests:
+            for i, nv in enumerate(JsonLdProcessor.arrayify(element[key])):
                 if not _is_object(nv):
                     raise JsonLdError(
                         'Invalid JSON-LD syntax; nested value must be a node object.',
@@ -2807,9 +2959,15 @@ class JsonLdProcessor:
                         code='invalid @nest value',
                     )
 
+                nv_location = None
+                if nest_location is not None:
+                    nv_location = nest_location
+                    if _is_array(element[key]):
+                        nv_location = nv_location.child(i)
+
                 # prepare type-scoped contexts when nested
-                active_ctx, type_key, type_scoped_ctx = self._prepare_nested_context(
-                    term_ctx, nv, options
+                active_ctx, type_key, type_scoped_ctx, nv_location = (
+                    self._prepare_nested_context(term_ctx, nv, options, nv_location)
                 )
 
                 if any(
@@ -2833,9 +2991,10 @@ class JsonLdProcessor:
                     inside_list=inside_list,
                     type_key=type_key,
                     type_scoped_ctx=type_scoped_ctx,
+                    location=nv_location,
                 )
 
-    def _prepare_nested_context(self, active_ctx, element, options):
+    def _prepare_nested_context(self, active_ctx, element, options, location=None):
         """
         Prepare local and type-scoped contexts for a nested node object.
 
@@ -2843,12 +3002,34 @@ class JsonLdProcessor:
         are merged into the parent node. Context processing is not transparent:
         a scoped context on the nest term must be active while discovering any
         @type entries and applying the type-scoped contexts they reference.
+
+        :param location: an optional _ExpansionLocation tracking the
+            source-document path and context origin for diagnostics.
+
+        :return: the active context, the key expanding to @type, the
+            type-scoped context, and the updated location.
         """
         # Recursively expand object: process context if element has one
         # Local contexts on the nested node apply before looking for @type,
         # just like they do for an ordinary node object.
         if '@context' in element:
             local_ctx = element['@context']
+            if location is not None:
+                context_pointer = _json_pointer(location.path + ('@context',))
+                for ctx_entry in JsonLdProcessor.arrayify(local_ctx):
+                    if _is_string(ctx_entry):
+                        location = location.with_context(
+                            {
+                                'kind': 'remote',
+                                'url': resolve(
+                                    ctx_entry, options.get('base', '') or None
+                                ),
+                            }
+                        )
+                    elif ctx_entry is not None and ctx_entry is not False:
+                        location = location.with_context(
+                            {'kind': 'local', 'pointer': context_pointer}
+                        )
             if (
                 _is_object(local_ctx)
                 and len(local_ctx) == 1
@@ -2889,8 +3070,12 @@ class JsonLdProcessor:
                     active_ctx = self._process_context(
                         active_ctx, ctx, options, propagate=False
                     )
+                    if location is not None:
+                        location = location.with_context(
+                            {'kind': 'type-scoped', 'type': type_}
+                        )
 
-        return active_ctx, type_key, type_scoped_ctx
+        return active_ctx, type_key, type_scoped_ctx, location
 
     def _flatten(self, input, options):
         """
@@ -3674,22 +3859,39 @@ class JsonLdProcessor:
                 code='invalid @nest value',
             )
 
-    def _expand_language_map(self, active_ctx, language_map, direction):
+    def _expand_language_map(
+        self, active_ctx, language_map, direction, options, location=None
+    ):
         """
         Expands a language map.
 
         :param active_ctx: the current active context.
         :param language_map: the language map to expand.
         :param direction the direction to apply to values.
+        :param options: the expansion options.
+        :param location: an optional _ExpansionLocation tracking the
+            source-document path and context origin for diagnostics.
 
         :return: the expanded language map.
         """
         rval = []
         for key, values in sorted(language_map.items()):
             expanded_key = self._expand_iri(active_ctx, key, vocab=True)
+            values_are_array = _is_array(values)
             values = JsonLdProcessor.arrayify(values)
-            for item in values:
+            for i, item in enumerate(values):
                 if item is None:
+                    if location is not None:
+                        item_location = location.child(key)
+                        if values_are_array:
+                            item_location = item_location.child(i)
+                        self._record_diagnostic(
+                            options,
+                            item_location,
+                            key,
+                            'null value',
+                            expanded_key,
+                        )
                     continue
                 if not _is_string(item):
                     raise JsonLdError(
@@ -3715,6 +3917,7 @@ class JsonLdProcessor:
         as_graph,
         property_index,
         options,
+        location=None,
     ):
         """
         Expands in index, id or type map.
@@ -3725,25 +3928,47 @@ class JsonLdProcessor:
         :param index_key: the key value used to index
         :param as_graph: contents should form a named graph
         :param property_index: index is a property
+        :param location: an optional _ExpansionLocation tracking the
+            source-document path and context origin for diagnostics.
         """
         rval = []
         is_type_index = index_key == '@type'
         for k, v in sorted(value.items()):
+            item_location = location.child(k) if location else None
             if is_type_index:
                 ctx = JsonLdProcessor.get_context_value(active_ctx, k, '@context')
                 if ctx is not None:
                     active_ctx = self._process_context(
                         active_ctx, ctx, options, propagate=False
                     )
+                    if item_location is not None:
+                        item_location = item_location.with_context(
+                            {'kind': 'type-scoped', 'type': k}
+                        )
 
-            v = self._expand(
-                active_ctx,
-                active_property,
-                JsonLdProcessor.arrayify(v),
-                options,
-                inside_list=False,
-                inside_index=True,
-            )
+            if _is_array(v):
+                v = self._expand(
+                    active_ctx,
+                    active_property,
+                    v,
+                    options,
+                    inside_list=False,
+                    inside_index=True,
+                    location=item_location,
+                )
+            else:
+                # expand single values directly so diagnostic pointers do not
+                # gain an array index that does not exist in the source
+                item = self._expand(
+                    active_ctx,
+                    active_property,
+                    v,
+                    options,
+                    inside_list=False,
+                    inside_index=True,
+                    location=item_location,
+                )
+                v = [] if item is None else [item]
 
             expanded_key = None
             if property_index:

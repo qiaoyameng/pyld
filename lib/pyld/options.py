@@ -18,6 +18,63 @@ Context = str | ContextObject | list[str | ContextObject]
 DocumentLoaderCallable = Callable[[str, dict[str, Any]], RemoteDocument]
 
 
+class ContextSource(TypedDict, total=False):
+    """One layer of the active context in effect when a diagnostic was recorded."""
+
+    kind: Literal[
+        'initial',
+        'expandContext',
+        'remote',
+        'local',
+        'property-scoped',
+        'term-scoped',
+        'type-scoped',
+    ]
+    """How the context layer was introduced: the `initial` context, the `expandContext`
+    option, a `remote` context from an HTTP Link header, a `local` `@context` in the
+    document, or a `property-scoped`, `term-scoped`, or `type-scoped` context."""
+
+    url: str
+    """The remote context URL, for `remote` layers."""
+
+    pointer: str
+    """JSON Pointer (RFC 6901) to the `@context` member in the source document, for
+    `local` layers."""
+
+    term: str
+    """The term whose definition carries the scoped context, for `property-scoped`
+    and `term-scoped` layers."""
+
+    type: str
+    """The `@type` value whose term definition carries the scoped context, for
+    `type-scoped` layers."""
+
+
+class ExpansionDiagnostic(TypedDict):
+    """A diagnostic describing a source field dropped during expansion."""
+
+    pointer: str
+    """JSON Pointer (RFC 6901) to the dropped field in the source document. Keys
+    containing `~` or `/` are escaped as `~0` and `~1`."""
+
+    key: str | None
+    """The original JSON key as it appears in the source document (never the
+    expanded IRI), or `None` for a dropped array item."""
+
+    reason: Literal['undefined term', 'not an absolute IRI', 'null value']
+    """Why the field was dropped: the key is not defined in the active context
+    (`undefined term`), the key expands to a relative IRI (`not an absolute IRI`),
+    or the value is null (`null value`)."""
+
+    expandedProperty: str | None
+    """The result of expanding the key against the active context: `None` for
+    undefined terms, otherwise the (relative) IRI that was rejected."""
+
+    contextSource: list[ContextSource]
+    """The layered origin of the active context in effect when the field was
+    dropped, outermost layer first."""
+
+
 class DocumentLoaderOptions(TypedDict, total=False):
     """Options shared by APIs that load remote contexts."""
 
@@ -74,6 +131,11 @@ class ExpandOptions(ExpandContextOptions, total=False):
 
     base: str
     """The base IRI to use."""
+
+    diagnostics: list[ExpansionDiagnostic]
+    """A list to be populated with a diagnostic for each source field dropped
+    during expansion (default: `None`, diagnostics disabled). Expansion results
+    are unchanged whether or not diagnostics are collected."""
 
     extractAllScripts: bool
     """`True` to extract all JSON-LD script elements from HTML, `False` to extract just the first (default: `False`)."""
