@@ -200,6 +200,9 @@ class ToRdfOptions(ProcessingOptions, total=False):
     legacyMode: bool
     """`True` to return the RDF.js-like dataset `dict` used by PyLD versions lower than 4 instead of an `rdflib.Dataset` when `format` is not set (default: `False`)."""
 
+    sourceMap: bool
+    """`True` to also return a `sourceMap` of provenance entries mapping each emitted RDF statement to the JSON Pointers of the input locations that produced it (default: `False`)."""
+
 
 class FromRdfOptions(TypedDict, total=False):
     format: Literal['application/n-quads']

@@ -25,7 +25,7 @@ import uuid
 import warnings
 from collections.abc import Callable
 from numbers import Integral, Real
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 import lxml.html
@@ -49,6 +49,18 @@ from pyld.canon import (
 from pyld.context_resolver import ContextResolver
 from pyld.identifier_issuer import IdentifierIssuer
 from pyld.iri_resolver import resolve, unresolve
+from pyld.provenance import (
+    COMPOUND_LITERAL_CONTAINER,
+    CONTAINER_TAG_KEY,
+    GRAPH_CONTAINER,
+    LIST_CONTAINER,
+    REVERSE_CONTAINER,
+    SOURCE_KEY,
+    TYPE_SOURCES_KEY,
+    SourceMap,
+    merge_sources,
+    source_of,
+)
 from pyld.options import (
     CompactOptions,
     Context,
@@ -78,6 +90,7 @@ __all__ = [
     'FromRdfOptions',
     'NormalizeOptions',
     'ToRdfOptions',
+    'ToRdfResult',
     'compact',
     'expand',
     'flatten',
@@ -103,6 +116,16 @@ __all__ = [
 
 # BCP47
 REGEX_BCP47 = r'^[a-zA-Z]{1,8}(-[a-zA-Z0-9]{1,8})*$'
+
+
+class ToRdfResult(NamedTuple):
+    """The `to_rdf` result when the `sourceMap` option is enabled."""
+
+    dataset: Any
+    """The RDF dataset, in the same form `to_rdf` returns without `sourceMap`."""
+
+    sourceMap: dict
+    """Maps each emitted N-Quads statement line to its provenance entries."""
 
 # JSON-LD keywords
 KEYWORDS = [
@@ -290,9 +313,15 @@ def to_rdf(input_, options: ToRdfOptions | None = None):
     :param input_: the JSON-LD input.
     :param options: optional processing options; see Options below.
 
-    :return: the resulting RDF dataset (or a serialization of it).
+    :return: the resulting RDF dataset (or a serialization of it). When the
+      `sourceMap` option is set, returns a `ToRdfResult` whose `dataset`
+      attribute is the usual result and whose `sourceMap` maps each emitted
+      statement to the JSON Pointers of the input locations that produced it.
     """
-    return JsonLdProcessor().to_rdf(input_, options)
+    result = JsonLdProcessor().to_rdf(input_, options)
+    if options and options.get('sourceMap'):
+        return ToRdfResult(dataset=result[0], sourceMap=result[1])
+    return result
 
 
 def set_document_loader(load_document_):
@@ -637,6 +666,11 @@ class JsonLdProcessor:
             else:
                 input_['expandContext'] = expand_context
 
+        source_map = options.get('sourceMap')
+        if source_map is not None:
+            # annotate the working copy so provenance rides through expansion
+            source_map.annotate(input_['document'])
+
         active_ctx = self._get_initial_context(options)
         document = input_['document']
         remote_context = input_['remoteContext']
@@ -655,7 +689,11 @@ class JsonLdProcessor:
         expanded = self._expand(active_ctx, None, document, options, inside_list=False)
 
         # optimize away @graph with no other properties
-        if _is_object(expanded) and '@graph' in expanded and len(expanded) == 1:
+        if (
+            _is_object(expanded)
+            and '@graph' in expanded
+            and all(_is_provenance_key(key) for key in expanded if key != '@graph')
+        ):
             expanded = expanded['@graph']
         elif expanded is None:
             expanded = []
@@ -1045,6 +1083,12 @@ class JsonLdProcessor:
         options.setdefault('processingMode', 'json-ld-1.1')
         options.setdefault('identifierIssuer', IdentifierIssuer('_:b'))
 
+        track_sources = bool(options.get('sourceMap'))
+        source_map = SourceMap() if track_sources else None
+        if track_sources:
+            # pass the tracker through expansion/node-map construction
+            options = {**options, 'sourceMap': source_map}
+
         try:
             # expand input
             expanded = self.expand(input_, options)
@@ -1056,23 +1100,39 @@ class JsonLdProcessor:
         # create node map for default graph (and any named graphs)
         issuer = options['identifierIssuer']
         node_map = {'@default': {}}
-        self._create_node_map(expanded, node_map, '@default', issuer)
+        self._create_node_map(
+            expanded, node_map, '@default', issuer, source_map=source_map
+        )
         # output RDF dataset
         dataset = Dataset()
         for graph_name, graph in sorted(node_map.items()):
             # skip relative IRIs
             if graph_name == '@default' or _is_valid_absolute_iri(graph_name):
                 g = self._rdflib_term_from_id(graph_name) if graph_name != '@default' else dataset.default_graph
-                for t in self._graph_to_rdf(graph, issuer, options):
-                    s, p, o = t
+                for t in self._graph_to_rdf(
+                    graph, issuer, options, graph_name, source_map
+                ):
+                    s, p, o, entries = t
                     dataset.add((s, p, o, g))
+                    if source_map is not None:
+                        graph_term = (
+                            self._rdflib_term_from_id(graph_name)
+                            if graph_name != '@default'
+                            else None
+                        )
+                        source_map.add_statement(
+                            (s, p, o), graph_term, entries
+                        )
         # convert to output format
         if 'format' in options:
             if (
                 options['format'] == 'application/n-quads'
                 or options['format'] == 'application/nquads'
             ):
-                return dataset.serialize(format='nquads')
+                serialized = dataset.serialize(format='nquads')
+                if track_sources:
+                    return serialized, source_map.to_dict()
+                return serialized
             raise JsonLdError(
                 'Unknown output format.',
                 'jsonld.UnknownFormat',
@@ -1080,7 +1140,14 @@ class JsonLdProcessor:
             )
         # In legacy mode, return RDF datasets as
         # RDFJS-like dict objects equivalent to PyLD < 4.0
-        return to_legacy_dataset(dataset) if options.get('legacyMode', False) else dataset
+        result = (
+            to_legacy_dataset(dataset)
+            if options.get('legacyMode', False)
+            else dataset
+        )
+        if track_sources:
+            return result, source_map.to_dict()
+        return result
 
     def process_context(self, active_ctx, local_ctx, options):
         """
@@ -2070,6 +2137,7 @@ class JsonLdProcessor:
         # recursively expand array
         if _is_array(element):
             rval = []
+            source_map = options.get('sourceMap')
             container = JsonLdProcessor.arrayify(
                 JsonLdProcessor.get_context_value(
                     active_ctx, active_property, '@container'
@@ -2088,7 +2156,10 @@ class JsonLdProcessor:
                     type_scoped_ctx=type_scoped_ctx,
                 )
                 if inside_list and _is_array(e):
-                    e = {'@list': e}
+                    list_wrapper = {'@list': e}
+                    if source_map is not None:
+                        list_wrapper[SOURCE_KEY] = source_map.array_pointer(element)
+                    e = list_wrapper
                 # drop None values
                 if e is not None:
                     if _is_array(e):
@@ -2107,7 +2178,13 @@ class JsonLdProcessor:
                 return None
 
             # expand element according to value expansion rules
-            return self._expand_value(active_ctx, active_property, element, options)
+            expanded = self._expand_value(
+                active_ctx, active_property, element, options
+            )
+            source_map = options.get('sourceMap')
+            if source_map is not None and isinstance(expanded, dict):
+                expanded[SOURCE_KEY] = source_map.scalar_pointer(element)
+            return expanded
 
         # expand the active property
         expanded_active_property = self._expand_iri(
@@ -2284,7 +2361,10 @@ class JsonLdProcessor:
                 )
             # optimize away @set
             if '@set' in rval:
-                rval = rval['@set']
+                set_value = rval['@set']
+                if options.get('sourceMap') is not None and _is_object(set_value):
+                    _copy_sources(options['sourceMap'], set_value, rval)
+                rval = set_value
                 count = len(rval)
         # drop objects with only @language
         elif count == 1 and '@language' in rval:
@@ -2305,6 +2385,15 @@ class JsonLdProcessor:
             or (count == 1 and '@id' in rval)
         ):
             rval = None
+
+        source_map = options.get('sourceMap')
+        if source_map is not None and isinstance(rval, dict):
+            # expanded node/value/container inherits the location of its
+            # source object unless it already carries a more specific one
+            if SOURCE_KEY not in rval:
+                element_sources = source_of(element)
+                if element_sources is not None:
+                    rval[SOURCE_KEY] = list(element_sources)
 
         return rval
 
@@ -2466,6 +2555,16 @@ class JsonLdProcessor:
                     else v
                     for v in JsonLdProcessor.arrayify(value)
                 ]
+                source_map = options.get('sourceMap')
+                if source_map is not None:
+                    scalar_pointers = source_map.scalar_pointer
+                    for expanded, original in zip(
+                        expanded_values, JsonLdProcessor.arrayify(value)
+                    ):
+                        if _is_string(expanded):
+                            source_map.remember_identifier(
+                                expanded, expanded, scalar_pointers(original)
+                            )
                 JsonLdProcessor.add_value(
                     expanded_parent,
                     '@type',
@@ -2659,7 +2758,9 @@ class JsonLdProcessor:
                 direction = JsonLdProcessor.get_context_value(
                     active_ctx, key, '@direction'
                 )
-                expanded_value = self._expand_language_map(term_ctx, value, direction)
+                expanded_value = self._expand_language_map(
+                    term_ctx, value, direction, options.get('sourceMap')
+                )
             # handle index container (skip if value is not an object)
             elif '@index' in container and _is_object(value):
                 index_key = JsonLdProcessor.get_context_value(term_ctx, key, '@index')
@@ -2712,6 +2813,11 @@ class JsonLdProcessor:
                     == '@json'
                 ):
                     expanded_value = {'@type': '@json', '@value': value}
+                    if options.get('sourceMap') is not None:
+                        json_sources = source_of(value)
+                        expanded_value[SOURCE_KEY] = (
+                            list(json_sources) if json_sources else []
+                        )
                 else:
                     # recursively expand value w/key as new active property
                     expanded_value = self._expand(
@@ -2729,7 +2835,15 @@ class JsonLdProcessor:
                 and '@list' in container
             ):
                 # ensure expanded value is an array
-                expanded_value = {'@list': JsonLdProcessor.arrayify(expanded_value)}
+                list_items = JsonLdProcessor.arrayify(expanded_value)
+                expanded_value = {'@list': list_items}
+                if options.get('sourceMap') is not None:
+                    tracker = options['sourceMap']
+                    if isinstance(value, list):
+                        list_pointers = tracker.array_pointer(value)
+                    else:
+                        list_pointers = list(source_of(value) or [])
+                    expanded_value[SOURCE_KEY] = list_pointers
 
             # convert expanded value to @graph
             if (
@@ -2737,9 +2851,13 @@ class JsonLdProcessor:
                 and '@id' not in container
                 and '@index' not in container
             ):
-                expanded_value = [
-                    {'@graph': [v]} for v in JsonLdProcessor.arrayify(expanded_value)
-                ]
+                graph_wrapped = []
+                for v in JsonLdProcessor.arrayify(expanded_value):
+                    graph_wrapper = {'@graph': [v]}
+                    if options.get('sourceMap') is not None:
+                        graph_wrapper[SOURCE_KEY] = list(source_of(v) or [])
+                    graph_wrapped.append(graph_wrapper)
+                expanded_value = graph_wrapped
 
             # merge in reverse properties
             mapping = term_ctx['mappings'].get(key)
@@ -3674,7 +3792,9 @@ class JsonLdProcessor:
                 code='invalid @nest value',
             )
 
-    def _expand_language_map(self, active_ctx, language_map, direction):
+    def _expand_language_map(
+        self, active_ctx, language_map, direction, source_map=None
+    ):
         """
         Expands a language map.
 
@@ -3703,6 +3823,8 @@ class JsonLdProcessor:
                     val['@language'] = key.lower()
                 if direction:
                     val['@direction'] = direction
+                if source_map is not None:
+                    val[SOURCE_KEY] = source_map.scalar_pointer(item)
                 rval.append(val)
         return rval
 
@@ -3728,7 +3850,10 @@ class JsonLdProcessor:
         """
         rval = []
         is_type_index = index_key == '@type'
+        source_map = options.get('sourceMap')
         for k, v in sorted(value.items()):
+            if source_map is not None and _is_provenance_key(k):
+                continue
             if is_type_index:
                 ctx = JsonLdProcessor.get_context_value(active_ctx, k, '@context')
                 if ctx is not None:
@@ -3762,7 +3887,11 @@ class JsonLdProcessor:
 
             for item in v:
                 if as_graph and not _is_graph(item):
-                    item = {'@graph': [item]}
+                    graph_wrapper = {'@graph': [item]}
+                    if source_map is not None:
+                        wrapper_sources = source_of(item) or []
+                        graph_wrapper[SOURCE_KEY] = list(wrapper_sources)
+                    item = graph_wrapper
                 if index_key == '@type':
                     if expanded_key == '@none':
                         # ignore @none
@@ -3773,6 +3902,14 @@ class JsonLdProcessor:
                         item['@type'] = types
                     else:
                         item['@type'] = [k]
+                        if source_map is not None and _is_string(k):
+                            implicit = source_map.implicit_type_sources.setdefault(
+                                id(item), {}
+                            )
+                            merge_sources(
+                                implicit.setdefault(k, []),
+                                source_of(item) or [],
+                            )
                 elif (
                     _is_value(item)
                     and '@language' not in index_key
@@ -3876,7 +4013,9 @@ class JsonLdProcessor:
         rval['@value'] = value
         return rval
 
-    def _graph_to_rdf(self, graph, issuer, options):
+    def _graph_to_rdf(
+        self, graph, issuer, options, graph_name='@default', source_map=None
+    ):
         """
         Creates an array of RDF triples for the given graph.
 
@@ -3887,9 +4026,14 @@ class JsonLdProcessor:
         :return: the array of RDF triples for the given graph.
         """
         triples = [] # TODO: use rdflib.Graph instead
+        graph_entries = (
+            source_map.graph_entries(graph_name) if source_map is not None else []
+        )
         for id_, node in sorted(graph.items()):
             for property, items in sorted(node.items()):
-                if property != '@type' and _is_keyword(property):
+                if _is_provenance_key(property) or (
+                    property != '@type' and _is_keyword(property)
+                ):
                     continue
 
                 for item in items:
@@ -3912,13 +4056,53 @@ class JsonLdProcessor:
                     predicate = self._rdflib_term_from_id(property) if property != '@type' else RDF.type
 
                     # convert list, value or node object to triple
-                    object = self._object_to_rdf(item, issuer, triples, options)
+                    object = self._object_to_rdf(
+                        item,
+                        issuer,
+                        triples,
+                        options,
+                        source_map=source_map,
+                    )
                     # skip None objects (they are relative IRIs)
                     if object is not None:
-                        triples.append((subject, predicate, object))
+                        entries = []
+                        if source_map is not None:
+                            if property == '@type':
+                                type_pointers = node.get(
+                                    TYPE_SOURCES_KEY, {}
+                                ).get(item, [])
+                                for pointer in type_pointers:
+                                    entries.append({'pointer': pointer})
+                            else:
+                                entries = self._provenance_entries(item)
+                                if isinstance(item, dict):
+                                    tag = item.get(CONTAINER_TAG_KEY)
+                                    if tag:
+                                        entries = [
+                                            entry
+                                            for entry in entries
+                                            if entry['pointer'] not in tag[1]
+                                        ]
+                                        for pointer in tag[1]:
+                                            entries.append(
+                                                {
+                                                    'pointer': pointer,
+                                                    'container': tag[0],
+                                                }
+                                            )
+                            entries.extend(graph_entries)
+                        triples.append((subject, predicate, object, entries))
         return triples
 
-    def _list_to_rdf(self, list_: list, issuer: IdentifierIssuer, triples, options) -> BNode | URIRef:
+    def _list_to_rdf(
+        self,
+        list_: list,
+        issuer: IdentifierIssuer,
+        triples,
+        options,
+        container_entries=None,
+        source_map=None,
+    ) -> BNode | URIRef:
         """
         Converts a @list value into a linked list of blank node RDF triples
         (and RDF collection).
@@ -3932,25 +4116,36 @@ class JsonLdProcessor:
         """
 
         last = list_.pop() if list_ else None
+        structure_entries = list(container_entries or [])
         # result is the head of the list
         result = self._rdflib_term_from_id(issuer.get_id()) if last else RDF.nil
         subject = result
 
         for item in list_:
-            object = self._object_to_rdf(item, issuer, triples, options)
+            object = self._object_to_rdf(
+                item, issuer, triples, options, source_map=source_map
+            )
             next = self._rdflib_term_from_id(issuer.get_id())
             if object is not None:
-                triples.append((subject, RDF.first, object))
-            triples.append((subject, RDF.rest, next))
+                first_entries = structure_entries + (
+                    self._provenance_entries(item) if source_map is not None else []
+                )
+                triples.append((subject, RDF.first, object, first_entries))
+            triples.append((subject, RDF.rest, next, structure_entries))
 
             subject = next
 
         # tail of list
         if last:
-            object = self._object_to_rdf(last, issuer, triples, options)
+            object = self._object_to_rdf(
+                last, issuer, triples, options, source_map=source_map
+            )
             if object is not None:
-                triples.append((subject, RDF.first, object))
-            triples.append((subject, RDF.rest, RDF.nil))
+                first_entries = structure_entries + (
+                    self._provenance_entries(last) if source_map is not None else []
+                )
+                triples.append((subject, RDF.first, object, first_entries))
+            triples.append((subject, RDF.rest, RDF.nil, structure_entries))
 
         return result
 
@@ -3973,7 +4168,9 @@ class JsonLdProcessor:
         """
         return '_:' + str(term) if isinstance(term, BNode) else str(term)
 
-    def _object_to_rdf(self, item, issuer, triples, options):
+    def _object_to_rdf(
+        self, item, issuer, triples, options, source_map=None
+    ):
         """
         Converts a JSON-LD value object to an RDF literal or a JSON-LD string
         or node object to an RDF resource.
@@ -4048,8 +4245,20 @@ class JsonLdProcessor:
             elif rdf_direction == 'compound-literal' and '@direction' in item:
                 # Create bnode to describe compound literal
                 subject = self._rdflib_term_from_id(issuer.get_id())
+                compound_entries = (
+                    self._provenance_entries(
+                        item, container=COMPOUND_LITERAL_CONTAINER
+                    )
+                    if source_map is not None
+                    else []
+                )
                 triples.append(
-                    (subject, RDF.value, Literal(value, datatype=XSD.string))
+                    (
+                        subject,
+                        RDF.value,
+                        Literal(value, datatype=XSD.string),
+                        compound_entries,
+                    )
                 )
                 triples.append(
                     (
@@ -4057,6 +4266,7 @@ class JsonLdProcessor:
                         RDF.direction,
                         Literal(item['@direction'], datatype=XSD.string,
                         normalize=False),
+                        compound_entries,
                     )
                 )
                 if '@language' in item:
@@ -4065,6 +4275,7 @@ class JsonLdProcessor:
                             subject,
                             RDF.language,
                             Literal(item['@language'], datatype=XSD.string, normalize=False),
+                            compound_entries,
                         )
                     )
                 return subject
@@ -4091,7 +4302,19 @@ class JsonLdProcessor:
             )
         # convert list object to RDF
         elif _is_list(item):
-            return self._list_to_rdf(item['@list'], issuer, triples, options)
+            container_entries = (
+                self._provenance_entries(item, container=LIST_CONTAINER)
+                if source_map is not None
+                else None
+            )
+            return self._list_to_rdf(
+                item['@list'],
+                issuer,
+                triples,
+                options,
+                container_entries=container_entries,
+                source_map=source_map,
+            )
 
         # convert string/node object to RDF
         else:
@@ -4174,6 +4397,127 @@ class JsonLdProcessor:
                 rval['@type'] = str(type_)
         return rval
 
+    def _add_node_value(
+        self, subject, property, value, source_map, allow_duplicate
+    ):
+        if source_map is not None and not allow_duplicate:
+            retained = self._find_retained_value(
+                subject, property, value
+            )
+            if retained is not None:
+                # semantically equal value exists: merge provenance only
+                self._merge_into(retained, value)
+                return
+        JsonLdProcessor.add_value(
+            subject,
+            property,
+            value,
+            {'propertyIsArray': True, 'allowDuplicate': allow_duplicate},
+        )
+
+    @staticmethod
+    def _semantic_identity(value):
+        """A value view with internal provenance annotation keys removed."""
+        if not isinstance(value, dict):
+            return value
+        return {
+            key: item
+            for key, item in value.items()
+            if not _is_provenance_key(key)
+        }
+
+    def _find_retained_value(self, subject, property, value):
+        identity = self._semantic_identity(value)
+        for existing in JsonLdProcessor.get_values(subject, property):
+            if self._semantic_identity(existing) == identity:
+                return existing
+        return None
+
+    def _merge_into(self, retained, value):
+        new_sources = source_of(value) or []
+        retained_sources = source_of(retained)
+        if retained_sources is None:
+            retained[SOURCE_KEY] = list(new_sources)
+        else:
+            merge_sources(retained_sources, new_sources)
+        new_tag = value.get(CONTAINER_TAG_KEY)
+        existing_tag = retained.get(CONTAINER_TAG_KEY)
+        if new_tag:
+            merge_sources(retained.setdefault(SOURCE_KEY, []), new_tag[1])
+            if existing_tag:
+                if existing_tag[0] == new_tag[0]:
+                    merge_sources(existing_tag[1], new_tag[1])
+                else:
+                    # different structural origins: the new side is no
+                    # longer tagged, it is a plain provenance pointer
+                    del retained[CONTAINER_TAG_KEY]
+            else:
+                retained[CONTAINER_TAG_KEY] = (
+                    new_tag[0], list(new_tag[1])
+                )
+
+    def _type_occurrence_pointers(self, input_, index):
+        pointers = []
+        for pointer in source_of(input_) or []:
+            pointers.append(pointer + '/@type')
+            if index:
+                pointers.append(pointer + '/@type' + '/' + str(index))
+        return pointers
+
+    def _add_type_value(
+        self,
+        node,
+        type_id,
+        input_,
+        source_map,
+        type_index=0,
+        implicit_pointers=None,
+    ):
+        """Adds an @type value, merging sources when the type is a duplicate."""
+        if source_map is None:
+            JsonLdProcessor.add_value(
+                node, '@type', type_id,
+                {'propertyIsArray': True, 'allowDuplicate': False},
+            )
+            return
+        if implicit_pointers is not None:
+            pointers = list(implicit_pointers)
+        else:
+            pointers = self._type_occurrence_pointers(input_, type_index)
+            merge_sources(pointers, source_map.identifier_pointers(type_id))
+        existing = JsonLdProcessor.get_values(node, '@type')
+        if type_id not in existing:
+            JsonLdProcessor.add_value(
+                node, '@type', type_id,
+                {'propertyIsArray': True, 'allowDuplicate': False},
+            )
+        type_sources = node.setdefault(TYPE_SOURCES_KEY, {})
+        merge_sources(type_sources.setdefault(type_id, []), pointers)
+
+    @staticmethod
+    def _provenance_entries(value, container=None):
+        """Builds provenance entries for the sources carried on ``value``."""
+        entries = []
+        for pointer in source_of(value) or []:
+            entry = {'pointer': pointer}
+            if container:
+                entry['container'] = container
+            entries.append(entry)
+        return entries
+
+    @staticmethod
+    def _child_pointers(value, key):
+        """
+        Pointers of a property occurrence ``value[key]`` (or each of its array
+        elements), derived from the property container's own pointers.
+        """
+        base = source_of(value) or []
+        encoded_key = str(key).replace('~', '~0').replace('/', '~1')
+        pointers = []
+        for pointer in base:
+            pointers.append(pointer + '/' + encoded_key)
+        return pointers
+
     def _create_node_map(
         self,
         input_,
@@ -4183,6 +4527,7 @@ class JsonLdProcessor:
         active_subject=None,
         active_property=None,
         list_=None,
+        source_map=None,
     ):
         """
         Recursively flattens the subjects in the given JSON-LD expanded
@@ -4207,6 +4552,7 @@ class JsonLdProcessor:
                     active_subject,
                     active_property,
                     list_,
+                    source_map=source_map,
                 )
             return
 
@@ -4221,9 +4567,21 @@ class JsonLdProcessor:
 
         # spec requires @type to be labeled first, so assign identifiers early
         if '@type' in input_:
-            for type_ in input_['@type']:
+            for type_index, type_ in enumerate(input_['@type']):
                 if type_.startswith('_:'):
-                    issuer.get_id(type_)
+                    relabeled = issuer.get_id(type_)
+                    if source_map is not None:
+                        source_map.remember_identifier(
+                            relabeled, relabeled,
+                            source_map.identifier_pointers(type_),
+                        )
+                        source_map.remember_identifier(
+                            relabeled,
+                            type_,
+                            self._type_occurrence_pointers(
+                                input_, type_index
+                            ),
+                        )
 
         # add values to list
         if _is_value(input_):
@@ -4235,16 +4593,19 @@ class JsonLdProcessor:
             if list_:
                 list_['@list'].append(input_)
             elif subject_node:
-                JsonLdProcessor.add_value(
+                self._add_node_value(
                     subject_node,
                     active_property,
                     input_,
-                    {'propertyIsArray': True, 'allowDuplicate': False},
+                    source_map,
+                    allow_duplicate=False,
                 )
             return
 
         if _is_list(input_):
             o = {'@list': []}
+            if source_map is not None:
+                o[SOURCE_KEY] = list(source_of(input_) or [])
             self._create_node_map(
                 input_['@list'],
                 graph_map,
@@ -4253,15 +4614,14 @@ class JsonLdProcessor:
                 active_subject,
                 active_property,
                 o,
+                source_map=source_map,
             )
             if list_:
                 list_['@list'].append(o)
             elif subject_node:
-                JsonLdProcessor.add_value(
-                    subject_node,
-                    active_property,
-                    o,
-                    {'propertyIsArray': True, 'allowDuplicate': True},
+                self._add_node_value(
+                    subject_node, active_property, o, source_map,
+                    allow_duplicate=True,
                 )
             return
 
@@ -4275,38 +4635,60 @@ class JsonLdProcessor:
 
         # create new subject or merge into existing one
         node = graph_map.setdefault(active_graph, {}).setdefault(id_, {'@id': id_})
+        if source_map is not None and SOURCE_KEY in input_:
+            node_sources = node.get(SOURCE_KEY)
+            if node_sources is None:
+                node[SOURCE_KEY] = list(source_of(input_) or [])
+            else:
+                merge_sources(node_sources, source_of(input_))
 
         if _is_object(active_subject):
             # reverse property relationship
-            JsonLdProcessor.add_value(
+            self._add_node_value(
                 node,
                 active_property,
                 active_subject,
-                {'propertyIsArray': True, 'allowDuplicate': False},
+                source_map,
+                allow_duplicate=False,
             )
         elif active_property:
             reference = {'@id': id_}
+            if source_map is not None:
+                reference[SOURCE_KEY] = list(source_of(input_) or [])
             if list_:
                 list_['@list'].append(reference)
             elif subject_node:
-                JsonLdProcessor.add_value(
+                self._add_node_value(
                     subject_node,
                     active_property,
                     reference,
-                    {'propertyIsArray': True, 'allowDuplicate': False},
+                    source_map,
+                    allow_duplicate=False,
                 )
 
         for property, objects in sorted(input_.items()):
             # skip @id
             if property == '@id':
                 continue
+            if _is_provenance_key(property):
+                continue
 
             # handle reverse properties
             if property == '@reverse':
-                referenced_node = {'@id': id_}
                 reverse_map = input_['@reverse']
                 for reverse_property, items in reverse_map.items():
+                    if _is_provenance_key(reverse_property):
+                        continue
                     for item in items:
+                        referenced_node = {'@id': id_}
+                        if source_map is not None:
+                            referenced_node[SOURCE_KEY] = list(
+                                source_of(item) or []
+                            )
+                            referenced_node[CONTAINER_TAG_KEY] = (
+                                REVERSE_CONTAINER,
+                                list(source_of(item) or []),
+                            )
                         self._create_node_map(
                             item,
                             graph_map,
@@ -4314,6 +4696,7 @@ class JsonLdProcessor:
                             issuer,
                             active_subject=referenced_node,
                             active_property=reverse_property,
+                            source_map=source_map,
                         )
                 continue
 
@@ -4322,12 +4705,32 @@ class JsonLdProcessor:
                 # add graph subjects map entry
                 graph_map.setdefault(id_, {})
                 g = active_graph if active_graph == '@merged' else id_
-                self._create_node_map(objects, graph_map, g, issuer)
+                if source_map is not None and g != '@default':
+                    graph_pointers = [
+                        pointer + '/@graph'
+                        for pointer in (source_of(input_) or [])
+                    ]
+                    source_map.set_graph_sources(
+                        id_,
+                        [
+                            {'pointer': pointer, 'container': GRAPH_CONTAINER}
+                            for pointer in graph_pointers
+                        ],
+                    )
+                self._create_node_map(
+                    objects, graph_map, g, issuer, source_map=source_map
+                )
                 continue
 
             # recurse into included
             if property == '@included':
-                self._create_node_map(objects, graph_map, active_graph, issuer)
+                self._create_node_map(
+                    objects,
+                    graph_map,
+                    active_graph,
+                    issuer,
+                    source_map=source_map,
+                )
                 continue
 
             # copy non-@type keywords
@@ -4359,15 +4762,31 @@ class JsonLdProcessor:
                 JsonLdProcessor.add_value(node, property, [], {'propertyIsArray': True})
                 continue
 
-            for o in objects:
+            for type_index, o in enumerate(objects):
                 if property == '@type':
                     # rename @type blank nodes
+                    original = o
                     o = issuer.get_id(o) if o.startswith('_:') else o
-                    JsonLdProcessor.add_value(
+                    implicit_pointers = None
+                    if source_map is not None:
+                        implicit_pointers = source_map.implicit_type_sources.get(
+                            id(input_), {}
+                        ).get(o)
+                    if source_map is not None and original.startswith('_:'):
+                        source_map.remember_identifier(
+                            o,
+                            original,
+                            self._type_occurrence_pointers(
+                                input_, type_index
+                            ),
+                        )
+                    self._add_type_value(
                         node,
-                        property,
                         o,
-                        {'propertyIsArray': True, 'allowDuplicate': False},
+                        input_,
+                        source_map,
+                        type_index,
+                        implicit_pointers=implicit_pointers,
                     )
                 else:
                     self._create_node_map(
@@ -4377,6 +4796,7 @@ class JsonLdProcessor:
                         issuer,
                         active_subject=id_,
                         active_property=property,
+                        source_map=source_map,
                     )
 
     def _merge_node_map_graphs(self, graph_map):
@@ -6394,6 +6814,29 @@ def _is_string(v):
     :return: True if the value is a String, False if not.
     """
     return isinstance(v, str)
+
+
+def _copy_sources(source_map, target, *values):
+    """Merges the provenance annotations of ``values`` into ``target``."""
+    if source_map is None:
+        return target
+    sources = source_of(target)
+    if sources is None:
+        sources = target[SOURCE_KEY] = []
+    for value in values:
+        value_sources = source_of(value)
+        if value_sources:
+            merge_sources(sources, value_sources)
+    return target
+
+
+def _is_provenance_key(key):
+    """True for internal provenance annotation keys carried on node maps."""
+    return key in (
+        SOURCE_KEY,
+        TYPE_SOURCES_KEY,
+        CONTAINER_TAG_KEY,
+    )
 
 
 def _validate_type_value(v, is_frame):
