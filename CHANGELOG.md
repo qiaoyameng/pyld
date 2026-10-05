@@ -4,6 +4,11 @@
 
 ### Added
 
+- Added `pyld.compare_contexts()` in `context_diff.py`: compares an old and a
+  new JSON-LD context under a fixed base IRI and reports term IRI, type and
+  language coercion, container, reverse, and protected definition changes.
+  Each constructible difference carries a replayable JSON-LD witness with both
+  expansion results; undecidable combinations are listed as undetermined.
 - Migrate `canon.py` to `rdflib`
   - Added `rdflib` dependency in all relevant config and code files.
   - Added `util.py`:

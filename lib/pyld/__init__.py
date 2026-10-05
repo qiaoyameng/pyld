@@ -1,6 +1,7 @@
 """The PyLD module is used to process JSON-LD."""
 
 from . import jsonld
+from .context_diff import compare_contexts
 from .context_resolver import ContextResolver
 from .documentloader.aiohttp import AioHttpDocumentLoader
 from .documentloader.base import DocumentLoader, RemoteDocument
@@ -23,5 +24,6 @@ __all__ = [
     'RequestsDocumentLoader',
     'RemoteDocument',
     'SqliteCacheRequestsDocumentLoader',
+    'compare_contexts',
     'jsonld',
 ]
