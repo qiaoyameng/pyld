@@ -970,6 +970,8 @@ class JsonLdProcessor:
             (boolean, integer, double), False not to (default: False).
           [rdfDirection] Either 'i18n-datatype' or 'compound-literal'
             is supported. (default: None)
+          [listDiagnostics] a list to populate with per-chain RDF list
+            conversion diagnostics (default: None).
 
         :return: the JSON-LD output.
         """
@@ -2980,6 +2982,9 @@ class JsonLdProcessor:
         default_graph = {}
         graph_map = {'@default': default_graph}
         referenced_once = {}
+        list_diagnostics = options.get('listDiagnostics')
+        if not isinstance(list_diagnostics, list):
+            list_diagnostics = None
 
         for s, p, o, graph_name in dataset.quads((None, None, None, None)):
             name = (
@@ -3045,70 +3050,9 @@ class JsonLdProcessor:
                 self._rdf_direction_to_compound_literal(graph_object)
 
             # convert linked lists to @list arrays
-
-            # no @lists to be converted, continue
-            if str(RDF.nil) not in graph_object:
-                continue
-
-            # iterate backwards through each RDF list
-            nil = graph_object[str(RDF.nil)]
-            if 'usages' not in nil:
-                continue
-            for usage in nil['usages']:
-                node = usage['node']
-                property = usage['property']
-                head = usage['value']
-                list_ = []
-                list_nodes = []
-
-                # ensure node is a well-formed list node; it must:
-                # 1. Be referenced only once.
-                # 2. Have an array for rdf:first that has 1 item.
-                # 3. Have an array for rdf:rest that has 1 item
-                # 4. Have no keys other than: @id, rdf:first, rdf:rest
-                #   and, optionally, @type where the value is rdf:List.
-                node_key_count = len(node)
-                while (
-                    property == str(RDF.rest)
-                    and _is_object(referenced_once.get(node['@id']))
-                    and _is_array(node[str(RDF.first)])
-                    and len(node[str(RDF.first)]) == 1
-                    and _is_array(node[str(RDF.rest)])
-                    and len(node[str(RDF.rest)]) == 1
-                    and (
-                        node_key_count == 3
-                        or (
-                            node_key_count == 4
-                            and _is_array(node.get('@type'))
-                            and len(node['@type']) == 1
-                            and node['@type'][0] == str(RDF.List)
-                        )
-                    )
-                ):
-                    list_.append(node[str(RDF.first)][0])
-                    list_nodes.append(node['@id'])
-
-                    # get next node, moving backwards through list
-                    usage = referenced_once[node['@id']]
-                    node = usage['node']
-                    property = usage['property']
-                    head = usage['value']
-                    node_key_count = len(node)
-
-                    # if node is not a blank node, then list head found
-                    if not node['@id'].startswith('_:'):
-                        break
-
-                # transform list into @list object
-                del head['@id']
-                list_.reverse()
-                head['@list'] = list_
-                for node in list_nodes:
-                    del graph_object[node]
-                    # graph_object.pop(node, None)
-
-            del nil['usages']
-            # nil.pop('usages', None)
+            self._from_rdf_lists(
+                graph_object, _name, graph_map, referenced_once, list_diagnostics
+            )
 
         result = []
         for subject, node in sorted(default_graph.items()):
@@ -3123,6 +3067,316 @@ class JsonLdProcessor:
                 result.append(node)
 
         return result
+
+    def _from_rdf_lists(
+        self, graph_object, graph_name, graph_map, referenced_once, diagnostics
+    ):
+        """
+        Converts well-formed RDF lists in a single graph to @list arrays.
+
+        A candidate chain is only collapsed when no information would be
+        lost; chains with problems remain ordinary nodes. When diagnostics
+        is a list, one entry per candidate chain (and per detached rdf:rest
+        cycle) is appended, identifying the graph, the chain nodes, whether
+        the chain collapsed, and the specific obstacle if it did not.
+
+        :param graph_object: the node map of the graph being converted.
+        :param graph_name: the name of that graph ('@default' or a graph id).
+        :param graph_map: the node maps of all graphs, used to detect list
+          structure that lives in another graph.
+        :param referenced_once: map of node ids to their single referencing
+          usage, or False where a node is referenced more than once.
+        :param diagnostics: a list to append diagnostic entries to, or None.
+        """
+        nil = graph_object.get(str(RDF.nil))
+        if nil is not None and 'usages' in nil:
+            # iterate backwards through each RDF list
+            for usage in nil['usages']:
+                self._from_rdf_list(
+                    usage,
+                    graph_object,
+                    graph_name,
+                    graph_map,
+                    referenced_once,
+                    diagnostics,
+                )
+            del nil['usages']
+
+        if diagnostics is not None:
+            self._from_rdf_list_cycles(graph_object, graph_name, diagnostics)
+
+    def _from_rdf_list(
+        self, usage, graph_object, graph_name, graph_map, referenced_once,
+        diagnostics,
+    ):
+        """
+        Converts a single RDF list chain ending in rdf:nil to an @list
+        array when lossless, recording a diagnostic entry if enabled.
+
+        :param usage: the rdf:nil usage ending the candidate chain.
+        :param graph_object: the node map of the graph being converted.
+        :param graph_name: the name of that graph ('@default' or a graph id).
+        :param graph_map: the node maps of all graphs.
+        :param referenced_once: map of node ids to their single referencing
+          usage, or False where a node is referenced more than once.
+        :param diagnostics: a list to append a diagnostic entry to, or None.
+        """
+        node = usage['node']
+        property = usage['property']
+        head = usage['value']
+        nil_head = head
+        list_ = []
+        list_nodes = []
+        walked = []
+        visited = set()
+        reason = None
+        obstacle_node = None
+        obstacle_object = None
+        obstacle_property = None
+        reset = False
+
+        # ensure node is a well-formed list node; it must:
+        # 1. Be referenced only once.
+        # 2. Have an array for rdf:first that has 1 item.
+        # 3. Have an array for rdf:rest that has 1 item
+        # 4. Have no keys other than: @id, rdf:first, rdf:rest
+        #   and, optionally, @type where the value is rdf:List.
+        # 5. Be referenced from within this graph, not only from another.
+        while property == str(RDF.rest):
+            node_id = node['@id']
+            if node_id in visited:
+                reason = 'cycle'
+                obstacle_node = node_id
+                obstacle_object = node
+                obstacle_property = str(RDF.rest)
+                reset = True
+                break
+            visited.add(node_id)
+            walked.append(node_id)
+            reason, obstacle_property = self._list_node_obstacle(
+                node, graph_map, graph_name, referenced_once
+            )
+            if reason is not None:
+                obstacle_node = node_id
+                obstacle_object = node
+                break
+            list_.append(node[str(RDF.first)][0])
+            list_nodes.append(node_id)
+
+            # get next node, moving backwards through list
+            usage = referenced_once[node_id]
+            next_node = usage['node']
+            if graph_object.get(next_node['@id']) is not next_node:
+                # the referrer lives in another graph; folding would move
+                # triples across graphs and lose graph membership
+                reason = 'cross-graph-reference'
+                obstacle_node = next_node['@id']
+                obstacle_object = next_node
+                obstacle_property = usage['property']
+                if obstacle_node not in walked:
+                    walked.append(obstacle_node)
+                reset = True
+                break
+            node = next_node
+            property = usage['property']
+            head = usage['value']
+
+            # if node is not a blank node, then list head found
+            if not node['@id'].startswith('_:'):
+                break
+
+        if reset:
+            # no in-graph head to attach a partial fold to; leave the
+            # whole chain as ordinary nodes
+            list_ = []
+            list_nodes = []
+            head = nil_head
+
+        # transform list into @list object
+        del head['@id']
+        list_.reverse()
+        head['@list'] = list_
+        for list_node in list_nodes:
+            del graph_object[list_node]
+
+        if diagnostics is None:
+            return
+        collapsed = reason is None
+        entry = {
+            'graph': graph_name,
+            'collapsed': collapsed,
+            'nodes': list(reversed(walked)),
+            'folded': list(reversed(list_nodes)),
+            'reason': reason,
+        }
+        if collapsed:
+            if walked:
+                entry['message'] = (
+                    f"folded {len(walked)} list node(s) "
+                    f"({', '.join(reversed(walked))}) in graph "
+                    f"'{graph_name}' into @list"
+                )
+            else:
+                entry['message'] = (
+                    f"rdf:nil used as a value in graph '{graph_name}'; "
+                    f"converted to an empty @list"
+                )
+        else:
+            entry['node'] = obstacle_node
+            if obstacle_property is not None:
+                entry['property'] = obstacle_property
+            entry['message'] = self._list_obstacle_message(
+                reason, graph_name, obstacle_node, obstacle_object
+            )
+        diagnostics.append(entry)
+
+    def _list_node_obstacle(self, node, graph_map, graph_name, referenced_once):
+        """
+        Checks whether a node is a well-formed RDF list node that can be
+        folded into an @list array without losing information.
+
+        :param node: the candidate list node.
+        :param graph_map: the node maps of all graphs.
+        :param graph_name: the name of the graph being converted.
+        :param referenced_once: map of node ids to their single referencing
+          usage, or False where a node is referenced more than once.
+
+        :return: (None, None) if the node is well-formed, otherwise a
+          (reason, property) tuple identifying the obstacle.
+        """
+        node_id = node['@id']
+        reference = referenced_once.get(node_id)
+        if reference is False:
+            return 'shared', None
+        if reference is None:
+            return 'unreferenced', None
+        first = node.get(str(RDF.first))
+        rest = node.get(str(RDF.rest))
+        if (
+            not _is_array(first)
+            or len(first) == 0
+            or not _is_array(rest)
+            or len(rest) == 0
+        ):
+            # a gap here; the list structure may live in another graph
+            for other_name, other_graph in graph_map.items():
+                if other_name == graph_name:
+                    continue
+                other = other_graph.get(node_id)
+                if other is None:
+                    continue
+                if str(RDF.first) in other or str(RDF.rest) in other:
+                    return 'cross-graph-reference', None
+            if not _is_array(first) or len(first) == 0:
+                return 'missing-first', str(RDF.first)
+            return 'missing-rest', str(RDF.rest)
+        if len(first) != 1:
+            return 'multiple-first', str(RDF.first)
+        if len(rest) != 1:
+            return 'multiple-rest', str(RDF.rest)
+        extra = set(node) - {'@id', str(RDF.first), str(RDF.rest)}
+        if extra == {'@type'}:
+            type_ = node['@type']
+            if (
+                _is_array(type_)
+                and len(type_) == 1
+                and type_[0] == str(RDF.List)
+            ):
+                return None, None
+        elif not extra:
+            return None, None
+        return 'extra-properties', sorted(extra)[0]
+
+    @staticmethod
+    def _list_obstacle_message(reason, graph_name, node_id, node):
+        """
+        Builds a locatable diagnostic message for a list-fold obstacle.
+        """
+        location = f"list node '{node_id}' in graph '{graph_name}'"
+        if reason == 'shared':
+            return (
+                f"{location} is referenced more than once; folding a "
+                f"shared chain would lose information"
+            )
+        if reason == 'unreferenced':
+            return (
+                f"{location} is not referenced by any other node, so its "
+                f"@list would have no parent"
+            )
+        if reason == 'missing-first':
+            return f"{location} has no rdf:first value (gap in the chain)"
+        if reason == 'multiple-first':
+            count = len(node[str(RDF.first)])
+            return f"{location} has {count} rdf:first values"
+        if reason == 'missing-rest':
+            return f"{location} has no rdf:rest value (gap in the chain)"
+        if reason == 'multiple-rest':
+            count = len(node[str(RDF.rest)])
+            return f"{location} has {count} rdf:rest values"
+        if reason == 'extra-properties':
+            extra = sorted(set(node) - {'@id', str(RDF.first), str(RDF.rest)})
+            return (
+                f"{location} has extra properties beyond @id, rdf:first, "
+                f"and rdf:rest: {', '.join(extra)}"
+            )
+        if reason == 'cross-graph-reference':
+            return (
+                f"list chain in graph '{graph_name}' crosses into node "
+                f"'{node_id}', which is described in another graph; "
+                f"folding would lose graph membership"
+            )
+        if reason == 'cycle':
+            return (
+                f"list chain in graph '{graph_name}' loops back to node "
+                f"'{node_id}' via rdf:rest and cannot be folded into @list"
+            )
+        return f"{location} cannot be folded into @list"
+
+    def _from_rdf_list_cycles(self, graph_object, graph_name, diagnostics):
+        """
+        Reports detached rdf:rest cycles, which no candidate-chain walk
+        can reach because they have no rdf:nil terminator.
+
+        :param graph_object: the node map of the graph being converted.
+        :param graph_name: the name of that graph ('@default' or a graph id).
+        :param diagnostics: the list to append diagnostic entries to.
+        """
+        visited = set()
+        for start in sorted(graph_object):
+            if start in visited:
+                continue
+            node = graph_object[start]
+            if str(RDF.first) not in node and str(RDF.rest) not in node:
+                continue
+            path = []
+            current = start
+            while current in graph_object and current not in visited:
+                visited.add(current)
+                path.append(current)
+                rest = graph_object[current].get(str(RDF.rest))
+                next_id = None
+                if _is_array(rest) and len(rest) == 1 and _is_object(rest[0]):
+                    next_id = rest[0].get('@id')
+                if next_id in path:
+                    cycle = path[path.index(next_id):]
+                    diagnostics.append(
+                        {
+                            'graph': graph_name,
+                            'collapsed': False,
+                            'nodes': cycle,
+                            'folded': [],
+                            'reason': 'cycle',
+                            'node': next_id,
+                            'property': str(RDF.rest),
+                            'message': (
+                                f"list nodes ({', '.join(cycle)}) in graph "
+                                f"'{graph_name}' form a cycle via rdf:rest "
+                                f"and cannot be folded into @list"
+                            ),
+                        }
+                    )
+                    break
+                current = next_id
 
     def _rdf_direction_to_compound_literal(self, graph_object):
         """

@@ -4,6 +4,15 @@
 
 ### Added
 
+- Added `listDiagnostics` option to `jsonld.from_rdf()`: pass a list to
+  receive one diagnostic entry per candidate RDF list chain (and per
+  detected `rdf:rest` cycle) identifying the graph, the chain nodes,
+  whether the chain collapsed into `@list`, and the specific obstacle
+  (multiple `rdf:first`/`rdf:rest`, gaps, cycles, shared tails, extra
+  properties, or cross-named-graph references) when it did not.
+  Problematic chains are still output as ordinary nodes, and cross-graph
+  list references no longer crash the conversion or fold triples into the
+  wrong graph.
 - Migrate `canon.py` to `rdflib`
   - Added `rdflib` dependency in all relevant config and code files.
   - Added `util.py`:

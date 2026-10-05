@@ -197,6 +197,14 @@ class ToRdfOptions(ProcessingOptions, total=False):
     rdfDirection: Literal['i18n-datatype', 'compound-literal']
     """Either `i18n-datatype` or `compound-literal` is supported (default: `None`)."""
 
+    listDiagnostics: list
+    """Optional list populated with RDF list conversion diagnostics. Pass a
+    list to enable list diagnostics; one entry is appended per candidate
+    list chain and per detected `rdf:rest` cycle. Each entry identifies the
+    `graph`, the candidate chain `nodes`, whether the chain `collapsed`
+    into `@list`, and, when it did not, the `reason`, the blocking `node`
+    and `property`, and a locatable `message` (default: `None`)."""
+
     legacyMode: bool
     """`True` to return the RDF.js-like dataset `dict` used by PyLD versions lower than 4 instead of an `rdflib.Dataset` when `format` is not set (default: `False`)."""
 
